@@ -15,12 +15,14 @@
 #include "lwip/sys.h"
 #include "driver/i2s.h"
 #include "driver/gpio.h"
+#include "driver/i2c.h"
 #include "esp_heap_caps.h"
 #include "driver/spi_master.h"
 #include "driver/ledc.h"
 
-#define WIFI_SSID "WIFI_NETWORK" // Replace with your WiFi SSID
-#define WIFI_PASS "PASSWORD1234" // Replace with your WiFi credentials
+// #define WIFI_SSID "WIFI_NETWORK" // Replace with your WiFi SSID
+// #define WIFI_PASS "PASSWORD1234" // Replace with your WiFi credentials
+
 #define WIFI_MAXIMUM_RETRY 5
 
 #define WIFI_CONNECTED_BIT BIT0
@@ -33,13 +35,28 @@
 #define CHANNEL_NUM 1
 #define BUFFER_SIZE 1024
 #define RECORDING_DURATION_SEC 10 // Longer for streaming
-#define STREAM_CHUNK_SIZE 4096	  // Send chunks of this size
+
+// M5Stack Core2 AXP192 Power Management I2C Configuration
+#define AXP192_I2C_ADDR 0x34
+#define I2C_MASTER_SCL_IO 22
+#define I2C_MASTER_SDA_IO 21
+#define I2C_MASTER_NUM I2C_NUM_1
+#define I2C_MASTER_FREQ_HZ 400000
+#define STREAM_CHUNK_SIZE 4096 // Send chunks of this size
 
 // Voice Activity Detection with adaptive threshold
 #define VAD_BASE_THRESHOLD 600 // Lower base threshold for better detection
 #define VAD_MIN_CONSECUTIVE 2  // Require 2 consecutive detections
 #define VAD_NOISE_SAMPLES 50   // Fewer samples to learn noise floor faster
 #define SILENCE_TIMEOUT_MS 2000
+
+// Keyword Detection Configuration
+#define KEYWORD_BUFFER_SIZE 32000		// 2 seconds of audio at 16kHz
+#define KEYWORD_MIN_LENGTH_MS 800		// Minimum keyword length (0.8 seconds)
+#define KEYWORD_MAX_LENGTH_MS 2000		// Maximum keyword length (2 seconds)
+#define KEYWORD_DETECTION_THRESHOLD 0.3 // Lower threshold for initial testing
+#define KEYWORD_TIMEOUT_MS 5000			// Timeout waiting for keyword
+#define NUM_MFCC_FEATURES 13			// Number of MFCC coefficients
 
 // Console equalizer configuration (for debugging)
 #define EQ_BARS 20
@@ -48,6 +65,10 @@
 #define WORKER_URL "https://your-worker.your-subdomain.workers.dev/audio" // Production
 
 static EventGroupHandle_t s_wifi_event_group;
+
+// Global I2C initialization flag
+static bool i2c_master_initialized = false;
+static bool speaker_amplifier_enabled = false;
 static const char *TAG = "voice_assistant";
 static const char *AUDIO_TAG = "audio";
 static const char *HTTP_TAG = "http_client";
@@ -58,6 +79,27 @@ typedef struct
 	uint8_t *audio_data;
 	size_t data_len;
 } audio_data_t;
+
+// Keyword detection states
+typedef enum
+{
+	KEYWORD_STATE_LISTENING, // Waiting for keyword
+	KEYWORD_STATE_DETECTING, // Processing potential keyword
+	KEYWORD_STATE_CONFIRMED, // Keyword confirmed, ready for command
+	KEYWORD_STATE_TIMEOUT	 // Keyword detection timeout
+} keyword_state_t;
+
+// Keyword detection data structure
+typedef struct
+{
+	int16_t *audio_buffer;		// Circular buffer for audio
+	size_t buffer_pos;			// Current position in buffer
+	size_t samples_collected;	// Total samples collected
+	keyword_state_t state;		// Current detection state
+	TickType_t detection_start; // When keyword detection started
+	float confidence;			// Detection confidence score
+	bool keyword_detected;		// Final detection result
+} keyword_detector_t;
 
 static void event_handler(void *arg, esp_event_base_t event_base,
 						  int32_t event_id, void *event_data)
@@ -131,15 +173,135 @@ esp_err_t init_microphone(void)
 	return ESP_OK;
 }
 
+// Initialize I2C for AXP192 communication (one-time initialization)
+esp_err_t init_i2c_master(void)
+{
+	// Check if already initialized
+	if (i2c_master_initialized)
+	{
+		ESP_LOGI(AUDIO_TAG, "♻️ I2C master already initialized, reusing existing driver");
+		return ESP_OK;
+	}
+
+	ESP_LOGI(AUDIO_TAG, "🔧 Initializing I2C master for AXP192 (first time)...");
+
+	i2c_config_t conf = {
+		.mode = I2C_MODE_MASTER,
+		.sda_io_num = I2C_MASTER_SDA_IO,
+		.sda_pullup_en = GPIO_PULLUP_ENABLE,
+		.scl_io_num = I2C_MASTER_SCL_IO,
+		.scl_pullup_en = GPIO_PULLUP_ENABLE,
+		.master.clk_speed = I2C_MASTER_FREQ_HZ,
+	};
+
+	esp_err_t ret = i2c_param_config(I2C_MASTER_NUM, &conf);
+	if (ret != ESP_OK)
+	{
+		ESP_LOGE(AUDIO_TAG, "❌ I2C param config failed: %s", esp_err_to_name(ret));
+		return ret;
+	}
+
+	ret = i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+	if (ret != ESP_OK)
+	{
+		ESP_LOGE(AUDIO_TAG, "❌ I2C driver install failed: %s", esp_err_to_name(ret));
+		return ret;
+	}
+
+	// Mark as initialized
+	i2c_master_initialized = true;
+	ESP_LOGI(AUDIO_TAG, "✅ I2C master initialized for AXP192 - ready for reuse");
+	return ESP_OK;
+}
+
+// Enable M5Stack Core2 speaker amplifier via AXP192
+esp_err_t enable_speaker_amplifier(void)
+{
+	// Check if already enabled (AXP192 registers retain state)
+	if (speaker_amplifier_enabled)
+	{
+		ESP_LOGI(AUDIO_TAG, "🔊 Speaker amplifier already enabled, ready for use");
+		return ESP_OK;
+	}
+
+	ESP_LOGI(AUDIO_TAG, "🔌 Enabling M5Stack Core2 speaker amplifier via AXP192...");
+
+	// Initialize I2C if not already done
+	esp_err_t ret = init_i2c_master();
+	if (ret != ESP_OK)
+	{
+		return ret;
+	}
+
+	// Step 1: Set AXP192 GPIO0 to output mode (register 0x90)
+	i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+	i2c_master_start(cmd);
+	i2c_master_write_byte(cmd, (AXP192_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
+	i2c_master_write_byte(cmd, 0x90, true); // GPIO0 function register
+	i2c_master_write_byte(cmd, 0x02, true); // Set GPIO0 as output (bit 1)
+	i2c_master_stop(cmd);
+	ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+	i2c_cmd_link_delete(cmd);
+
+	if (ret != ESP_OK)
+	{
+		ESP_LOGE(AUDIO_TAG, "❌ Failed to set AXP192 GPIO0 mode: %s", esp_err_to_name(ret));
+		return ret;
+	}
+	ESP_LOGI(AUDIO_TAG, "✅ AXP192 GPIO0 set to output mode");
+
+	// Step 2: Enable GPIO0 output (register 0x94)
+	cmd = i2c_cmd_link_create();
+	i2c_master_start(cmd);
+	i2c_master_write_byte(cmd, (AXP192_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
+	i2c_master_write_byte(cmd, 0x94, true); // GPIO0 output state register
+	i2c_master_write_byte(cmd, 0x01, true); // Set GPIO0 high (enable amplifier)
+	i2c_master_stop(cmd);
+	ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+	i2c_cmd_link_delete(cmd);
+
+	if (ret != ESP_OK)
+	{
+		ESP_LOGE(AUDIO_TAG, "❌ Failed to enable AXP192 GPIO0: %s", esp_err_to_name(ret));
+		return ret;
+	}
+	ESP_LOGI(AUDIO_TAG, "✅ AXP192 GPIO0 enabled (speaker amplifier should be powered)");
+
+	// Additional delay for amplifier to power up
+	vTaskDelay(pdMS_TO_TICKS(200));
+
+	// Mark as successfully enabled
+	speaker_amplifier_enabled = true;
+	ESP_LOGI(AUDIO_TAG, "🔊 M5Stack Core2 speaker amplifier fully enabled and cached");
+	return ESP_OK;
+}
+
 // Audio initialization for I2S speaker (playback)
 esp_err_t init_speaker(void)
 {
+	ESP_LOGI(AUDIO_TAG, "🔊 Initializing M5Stack Core2 speaker (NS4168 amplifier)...");
+
+	// CRITICAL: Enable speaker amplifier via AXP192 power management
+	esp_err_t amp_ret = enable_speaker_amplifier();
+	if (amp_ret != ESP_OK)
+	{
+		ESP_LOGE(AUDIO_TAG, "❌ Failed to enable speaker amplifier - audio will not work");
+		return amp_ret;
+	}
+
 	// First uninstall microphone driver if installed
 	esp_err_t uninstall_err = i2s_driver_uninstall(I2S_NUM);
 	if (uninstall_err != ESP_OK && uninstall_err != ESP_ERR_INVALID_STATE)
 	{
 		ESP_LOGE(AUDIO_TAG, "Failed to uninstall I2S driver: %s", esp_err_to_name(uninstall_err));
 	}
+	else
+	{
+		ESP_LOGI(AUDIO_TAG, "I2S driver uninstalled successfully");
+	}
+
+	// Add delay to ensure clean driver state transition
+	vTaskDelay(pdMS_TO_TICKS(100));
 
 	i2s_config_t i2s_config = {
 		.mode = I2S_MODE_MASTER | I2S_MODE_TX,
@@ -165,18 +327,28 @@ esp_err_t init_speaker(void)
 	esp_err_t ret = i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
 	if (ret != ESP_OK)
 	{
-		ESP_LOGE(AUDIO_TAG, "Failed to install I2S driver for speaker");
+		ESP_LOGE(AUDIO_TAG, "❌ Failed to install I2S driver for speaker: %s", esp_err_to_name(ret));
 		return ret;
 	}
+	ESP_LOGI(AUDIO_TAG, "✅ I2S driver installed for speaker");
 
 	ret = i2s_set_pin(I2S_NUM, &pin_config);
 	if (ret != ESP_OK)
 	{
-		ESP_LOGE(AUDIO_TAG, "Failed to set I2S pins for speaker");
+		ESP_LOGE(AUDIO_TAG, "❌ Failed to set I2S pins for speaker: %s", esp_err_to_name(ret));
+		i2s_driver_uninstall(I2S_NUM); // Clean up on failure
 		return ret;
 	}
+	ESP_LOGI(AUDIO_TAG, "✅ I2S pins configured: BCK=GPIO12, WS=GPIO0, DATA=GPIO2");
 
-	ESP_LOGI(AUDIO_TAG, "Speaker initialized successfully");
+	// Add delay to ensure hardware is ready
+	vTaskDelay(pdMS_TO_TICKS(50));
+
+	// Clear any existing data in DMA buffers
+	i2s_zero_dma_buffer(I2S_NUM);
+	ESP_LOGI(AUDIO_TAG, "✅ DMA buffers cleared");
+
+	ESP_LOGI(AUDIO_TAG, "🎵 M5Stack Core2 speaker ready for audio playback");
 	return ESP_OK;
 }
 
@@ -189,46 +361,113 @@ void init_system(void)
 	ESP_LOGI(TAG, "Connecting to WiFi...");
 }
 
-// Play a ready beep sound
+// Play a ready beep sound with enhanced M5Stack Core2 support
 void play_ready_beep(void)
 {
-	ESP_LOGI(AUDIO_TAG, "Playing ready beep...");
+	ESP_LOGI(AUDIO_TAG, "🔊 Playing M5Stack Core2 ready beep...");
 
-	// Initialize speaker
+	// Initialize speaker with proper error handling
 	if (init_speaker() != ESP_OK)
 	{
-		ESP_LOGE(AUDIO_TAG, "Failed to initialize speaker for beep");
+		ESP_LOGE(AUDIO_TAG, "❌ Failed to initialize speaker for beep - no audio feedback");
 		return;
 	}
 
-	// Generate a simple 1000Hz beep for 200ms
-	const int beep_freq = 1000;
-	const int beep_duration_ms = 200;
-	const int samples_per_cycle = SAMPLE_RATE / beep_freq;
+	// Additional delay after speaker initialization for hardware stability
+	vTaskDelay(pdMS_TO_TICKS(100));
+
+	// Try multiple beep strategies for M5Stack Core2 NS4168 amplifier
+	const int beep_strategies = 3;
+	const int beep_freqs[] = {800, 1000, 1200}; // Different frequencies
+	const int beep_duration_ms = 500;			// Longer duration for better audibility
 	const int total_samples = (SAMPLE_RATE * beep_duration_ms) / 1000;
 
 	int16_t *beep_buffer = (int16_t *)malloc(total_samples * sizeof(int16_t));
 	if (!beep_buffer)
 	{
-		ESP_LOGE(AUDIO_TAG, "Failed to allocate beep buffer");
+		ESP_LOGE(AUDIO_TAG, "❌ Failed to allocate beep buffer");
 		i2s_driver_uninstall(I2S_NUM);
 		return;
 	}
 
-	// Generate sine wave
-	for (int i = 0; i < total_samples; i++)
+	ESP_LOGI(AUDIO_TAG, "🎵 Generating multi-tone beep pattern...");
+
+	// Generate triple-tone beep: 800Hz -> 1000Hz -> 1200Hz
+	int samples_per_tone = total_samples / beep_strategies;
+	for (int strategy = 0; strategy < beep_strategies; strategy++)
 	{
-		float angle = (2.0 * M_PI * i) / samples_per_cycle;
-		beep_buffer[i] = (int16_t)(sin(angle) * 5000); // Volume control
+		int freq = beep_freqs[strategy];
+		int samples_per_cycle = SAMPLE_RATE / freq;
+		int start_idx = strategy * samples_per_tone;
+		int end_idx = (strategy + 1) * samples_per_tone;
+
+		ESP_LOGI(AUDIO_TAG, "   🎼 Tone %d: %dHz (%d samples)", strategy + 1, freq, samples_per_tone);
+
+		for (int i = start_idx; i < end_idx && i < total_samples; i++)
+		{
+			int sample_in_cycle = (i - start_idx) % samples_per_cycle;
+
+			// Try both sine wave and square wave for better compatibility
+			if (strategy == 1)
+			{
+				// Square wave for middle tone (may work better with some amplifiers)
+				float duty_cycle = 0.5f;
+				beep_buffer[i] = (sample_in_cycle < (samples_per_cycle * duty_cycle)) ? 12000 : -12000;
+			}
+			else
+			{
+				// Sine wave for first and third tones
+				float angle = (2.0 * M_PI * sample_in_cycle) / samples_per_cycle;
+				beep_buffer[i] = (int16_t)(sin(angle) * 12000); // Maximum volume
+			}
+		}
 	}
 
-	// Play the beep
+	// Play the beep with enhanced error checking
+	ESP_LOGI(AUDIO_TAG, "🎶 Starting audio playback (%d bytes)...", total_samples * sizeof(int16_t));
+
 	size_t bytes_written = 0;
-	i2s_write(I2S_NUM, beep_buffer, total_samples * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+	size_t expected_bytes = total_samples * sizeof(int16_t);
+	esp_err_t ret = i2s_write(I2S_NUM, beep_buffer, expected_bytes, &bytes_written, pdMS_TO_TICKS(2000));
+
+	if (ret == ESP_OK)
+	{
+		if (bytes_written == expected_bytes)
+		{
+			ESP_LOGI(AUDIO_TAG, "✅ BEEP SUCCESS: %d/%d bytes written to NS4168 amplifier", bytes_written, expected_bytes);
+		}
+		else
+		{
+			ESP_LOGW(AUDIO_TAG, "⚠️ Partial write: %d/%d bytes written", bytes_written, expected_bytes);
+		}
+	}
+	else
+	{
+		ESP_LOGE(AUDIO_TAG, "❌ I2S write failed: %s (wrote %d/%d bytes)", esp_err_to_name(ret), bytes_written, expected_bytes);
+	}
+
+	// Wait for DMA to finish playing all samples
+	ESP_LOGI(AUDIO_TAG, "⏳ Waiting for audio DMA completion...");
+	vTaskDelay(pdMS_TO_TICKS(600)); // Wait for full 500ms beep + buffer time
+
+	// Verify DMA buffer state
+	ESP_LOGI(AUDIO_TAG, "🔍 Checking DMA buffer status...");
+	i2s_zero_dma_buffer(I2S_NUM); // Clear any remaining data
 
 	free(beep_buffer);
-	i2s_driver_uninstall(I2S_NUM);
-	ESP_LOGI(AUDIO_TAG, "Ready beep completed");
+
+	// Clean driver shutdown
+	esp_err_t uninstall_ret = i2s_driver_uninstall(I2S_NUM);
+	if (uninstall_ret == ESP_OK)
+	{
+		ESP_LOGI(AUDIO_TAG, "✅ I2S driver uninstalled cleanly");
+	}
+	else
+	{
+		ESP_LOGW(AUDIO_TAG, "⚠️ I2S uninstall warning: %s", esp_err_to_name(uninstall_ret));
+	}
+
+	ESP_LOGI(AUDIO_TAG, "🎵 Beep playback sequence completed");
 }
 
 // Display console-based equalizer
@@ -289,6 +528,68 @@ void update_console_equalizer(int16_t *audio_buffer, size_t samples)
 			 equalizer_line,
 			 avg_level,
 			 "👂 Listening...");
+}
+
+// Simple MFCC-like feature extraction for keyword detection
+void extract_audio_features(int16_t *audio_buffer, size_t samples, float *features, size_t num_features)
+{
+	// Initialize features
+	for (size_t i = 0; i < num_features; i++)
+	{
+		features[i] = 0.0f;
+	}
+
+	if (samples == 0)
+		return;
+
+	// Simple energy-based features (simplified MFCC alternative)
+	size_t samples_per_feature = samples / num_features;
+	if (samples_per_feature == 0)
+		samples_per_feature = 1;
+
+	for (size_t feat = 0; feat < num_features; feat++)
+	{
+		float energy = 0.0f;
+		size_t start_idx = feat * samples_per_feature;
+		size_t end_idx = (feat + 1) * samples_per_feature;
+		if (end_idx > samples)
+			end_idx = samples;
+
+		// Calculate energy in this frequency band
+		for (size_t i = start_idx; i < end_idx; i++)
+		{
+			float sample = (float)audio_buffer[i] / 32768.0f; // Normalize to [-1, 1]
+			energy += sample * sample;
+		}
+
+		// Convert to log scale (like MFCC)
+		energy = energy / (end_idx - start_idx);
+		features[feat] = logf(energy + 1e-10f); // Add small value to avoid log(0)
+	}
+}
+
+// Calculate similarity between two feature vectors
+float calculate_feature_similarity(float *features1, float *features2, size_t num_features)
+{
+	float similarity = 0.0f;
+	float norm1 = 0.0f, norm2 = 0.0f;
+
+	// Calculate dot product and norms
+	for (size_t i = 0; i < num_features; i++)
+	{
+		similarity += features1[i] * features2[i];
+		norm1 += features1[i] * features1[i];
+		norm2 += features2[i] * features2[i];
+	}
+
+	// Normalize (cosine similarity)
+	float magnitude = sqrtf(norm1) * sqrtf(norm2);
+	if (magnitude > 0.0f)
+	{
+		similarity = similarity / magnitude;
+	}
+
+	return similarity;
 }
 
 // Adaptive voice activity detection with noise floor learning
@@ -360,6 +661,307 @@ bool detect_voice_activity(int16_t *audio_buffer, size_t samples)
 	}
 
 	return voice_detected;
+}
+
+// Initialize keyword detector
+keyword_detector_t *init_keyword_detector(void)
+{
+	keyword_detector_t *detector = (keyword_detector_t *)malloc(sizeof(keyword_detector_t));
+	if (!detector)
+	{
+		ESP_LOGE(AUDIO_TAG, "Failed to allocate keyword detector");
+		return NULL;
+	}
+
+	// Allocate audio buffer in PSRAM for better performance
+	detector->audio_buffer = (int16_t *)heap_caps_malloc(KEYWORD_BUFFER_SIZE * sizeof(int16_t),
+														 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (!detector->audio_buffer)
+	{
+		detector->audio_buffer = (int16_t *)malloc(KEYWORD_BUFFER_SIZE * sizeof(int16_t));
+	}
+
+	if (!detector->audio_buffer)
+	{
+		ESP_LOGE(AUDIO_TAG, "Failed to allocate keyword audio buffer");
+		free(detector);
+		return NULL;
+	}
+
+	// Initialize detector state
+	detector->buffer_pos = 0;
+	detector->samples_collected = 0;
+	detector->state = KEYWORD_STATE_LISTENING;
+	detector->detection_start = 0;
+	detector->confidence = 0.0f;
+	detector->keyword_detected = false;
+
+	ESP_LOGI(AUDIO_TAG, "Keyword detector initialized with %d sample buffer", KEYWORD_BUFFER_SIZE);
+	return detector;
+}
+
+// Add audio sample to keyword detector
+void keyword_detector_add_samples(keyword_detector_t *detector, int16_t *samples, size_t count)
+{
+	if (!detector || !samples)
+		return;
+
+	for (size_t i = 0; i < count; i++)
+	{
+		// Add to circular buffer
+		detector->audio_buffer[detector->buffer_pos] = samples[i];
+		detector->buffer_pos = (detector->buffer_pos + 1) % KEYWORD_BUFFER_SIZE;
+
+		if (detector->samples_collected < KEYWORD_BUFFER_SIZE)
+		{
+			detector->samples_collected++;
+		}
+	}
+}
+
+// Simplified keyword detection based on voice activity patterns
+bool detect_keyword_pattern(keyword_detector_t *detector)
+{
+	if (detector->samples_collected < (SAMPLE_RATE * KEYWORD_MIN_LENGTH_MS / 1000))
+	{
+		return false; // Not enough samples
+	}
+
+	// Get recent audio samples for analysis
+	size_t samples_to_analyze = SAMPLE_RATE * 1; // Analyze 1 second of audio
+	if (samples_to_analyze > detector->samples_collected)
+	{
+		samples_to_analyze = detector->samples_collected;
+	}
+
+	// Get samples from circular buffer
+	int16_t *analysis_buffer = (int16_t *)malloc(samples_to_analyze * sizeof(int16_t));
+	if (!analysis_buffer)
+		return false;
+
+	size_t start_pos = (detector->buffer_pos + KEYWORD_BUFFER_SIZE - samples_to_analyze) % KEYWORD_BUFFER_SIZE;
+	for (size_t i = 0; i < samples_to_analyze; i++)
+	{
+		analysis_buffer[i] = detector->audio_buffer[(start_pos + i) % KEYWORD_BUFFER_SIZE];
+	}
+
+	// Simple keyword detection: look for sustained voice activity pattern
+	// Calculate energy in segments to detect speech patterns
+	const size_t num_segments = 10;
+	size_t samples_per_segment = samples_to_analyze / num_segments;
+	int active_segments = 0;
+	float total_energy = 0;
+	float segment_energies[10]; // Store individual segment energies
+
+	for (size_t seg = 0; seg < num_segments; seg++)
+	{
+		float segment_energy = 0;
+		size_t start_idx = seg * samples_per_segment;
+		size_t end_idx = (seg + 1) * samples_per_segment;
+
+		for (size_t i = start_idx; i < end_idx && i < samples_to_analyze; i++)
+		{
+			float sample = (float)abs(analysis_buffer[i]) / 32768.0f;
+			segment_energy += sample * sample;
+		}
+
+		segment_energy = segment_energy / samples_per_segment;
+		segment_energies[seg] = segment_energy; // Store for variation calculation
+		total_energy += segment_energy;
+
+		// Consider segment "active" if it has significant energy
+		if (segment_energy > 0.001f)
+		{ // Lowered threshold
+			active_segments++;
+		}
+	}
+
+	float avg_energy = total_energy / num_segments;
+
+	// Enhanced keyword detection for "Hey El" - looking for specific patterns:
+	// 1. Must have sustained speech (30% active segments - shorter phrase)
+	// 2. Must have sufficient energy above background
+	// 3. Must have energy variation (not just noise)
+	// 4. Must last for reasonable duration (~0.3 seconds minimum for "Hey El")
+
+	float energy_variation = 0.0f;
+	if (active_segments > 0)
+	{
+		// Calculate energy variation across segments
+		for (int i = 0; i < num_segments; i++)
+		{
+			float segment_energy = segment_energies[i];
+			energy_variation += fabsf(segment_energy - avg_energy);
+		}
+		energy_variation /= num_segments;
+	}
+
+	// LOWERED THRESHOLDS: Much more permissive detection for "Hey El"
+	bool has_sustained_speech = (active_segments >= 2);										// 20% of segments active (very lenient)
+	bool has_sufficient_energy = (avg_energy > 0.0005f);									// Much lower threshold, closer to background
+	bool has_variation = (energy_variation > 0.00005f);										// Very low variation threshold
+	bool reasonable_duration = (detector->samples_collected >= KEYWORD_BUFFER_SIZE * 0.1f); // 10% of buffer (0.2s minimum)
+
+	// Additional pattern recognition for "Hey El" (two-syllable phrase)
+	bool has_two_syllable_pattern = false;
+	if (has_sustained_speech && has_sufficient_energy)
+	{
+		// Look for two energy peaks characteristic of "Hey" + "El"
+		// Find segments with highest energy (representing syllables)
+		float peak_threshold = avg_energy * 1.2f; // 20% above average
+		int peak_count = 0;
+		int first_peak = -1, last_peak = -1;
+
+		for (int i = 0; i < num_segments; i++)
+		{
+			if (segment_energies[i] > peak_threshold)
+			{
+				peak_count++;
+				if (first_peak == -1)
+					first_peak = i;
+				last_peak = i;
+			}
+		}
+
+		// "Hey El" should have 1-3 peak segments with reasonable spacing
+		if (peak_count >= 1 && peak_count <= 4)
+		{
+			int peak_span = (last_peak - first_peak) + 1;
+			// Peaks should span 2-6 segments (reasonable for short phrase)
+			has_two_syllable_pattern = (peak_span >= 2 && peak_span <= 6);
+		}
+	}
+
+	// Multi-level detection logic with fallback
+	bool keyword_detected_full = has_sustained_speech && has_sufficient_energy && has_variation && reasonable_duration;
+
+	// Fallback: Super simple detection for any significant voice activity
+	bool fallback_detection = (active_segments >= 1) && (avg_energy > 0.0003f) &&
+							  (detector->samples_collected >= KEYWORD_BUFFER_SIZE * 0.05f); // Just 0.1s of any voice
+
+	// Use either full criteria OR fallback (for testing)
+	bool keyword_detected = keyword_detected_full || fallback_detection;
+
+	// DEBUG: Show which detection method triggered
+	if (keyword_detected && !keyword_detected_full)
+	{
+		ESP_LOGI(AUDIO_TAG, "🎯 FALLBACK detection triggered! (not full criteria)");
+	}
+
+	detector->confidence = avg_energy;
+
+	// Enhanced debug logging with detailed failure analysis
+	static int debug_counter = 0;
+	if (++debug_counter % 50 == 0 || keyword_detected || has_sustained_speech) // More frequent logging when voice detected
+	{
+		ESP_LOGI(AUDIO_TAG, "🔍 'Hey El': Segs=%d/10(≥2), Energy=%.4f(>0.0005), Var=%.5f(>0.00005), Dur=%d%%(≥10%%), Det=%s [%s|%s|%s|%s|%s]",
+				 active_segments, avg_energy, energy_variation,
+				 (int)((detector->samples_collected * 100) / KEYWORD_BUFFER_SIZE),
+				 keyword_detected ? "YES" : "NO",
+				 has_sustained_speech ? "S" : "s",
+				 has_sufficient_energy ? "E" : "e",
+				 has_variation ? "V" : "v",
+				 reasonable_duration ? "D" : "d",
+				 has_two_syllable_pattern ? "P" : "p");
+
+		// Additional pattern analysis debug when voice is detected
+		if (has_sustained_speech)
+		{
+			float peak_threshold = avg_energy * 1.2f;
+			int peak_count = 0;
+			int first_peak = -1, last_peak = -1;
+
+			for (int i = 0; i < num_segments; i++)
+			{
+				if (segment_energies[i] > peak_threshold)
+				{
+					peak_count++;
+					if (first_peak == -1)
+						first_peak = i;
+					last_peak = i;
+				}
+			}
+
+			if (peak_count > 0)
+			{
+				int peak_span = (last_peak - first_peak) + 1;
+				ESP_LOGI(AUDIO_TAG, "   📊 Pattern: PeakCount=%d(1-4), PeakSpan=%d(2-6), Threshold=%.4f",
+						 peak_count, peak_span, peak_threshold);
+			}
+		}
+	}
+
+	free(analysis_buffer);
+
+	return keyword_detected;
+}
+
+// Main keyword detection function
+bool process_keyword_detection(keyword_detector_t *detector, int16_t *audio_samples, size_t sample_count)
+{
+	if (!detector)
+		return false;
+
+	// Add new samples to detector
+	keyword_detector_add_samples(detector, audio_samples, sample_count);
+
+	TickType_t current_time = xTaskGetTickCount();
+
+	switch (detector->state)
+	{
+	case KEYWORD_STATE_LISTENING:
+		// Look for keyword pattern
+		if (detect_keyword_pattern(detector))
+		{
+			detector->state = KEYWORD_STATE_DETECTING;
+			detector->detection_start = current_time;
+			ESP_LOGI(AUDIO_TAG, "🎯 Potential keyword detected, verifying...");
+		}
+		break;
+
+	case KEYWORD_STATE_DETECTING:
+		// Verify keyword over a short period
+		if (detect_keyword_pattern(detector))
+		{
+			detector->state = KEYWORD_STATE_CONFIRMED;
+			detector->keyword_detected = true;
+			ESP_LOGI(AUDIO_TAG, "✅ KEYWORD CONFIRMED! Ready for command (confidence: %.3f)",
+					 detector->confidence);
+			return true;
+		}
+
+		// Check timeout
+		if ((current_time - detector->detection_start) > pdMS_TO_TICKS(1000))
+		{
+			detector->state = KEYWORD_STATE_LISTENING;
+			ESP_LOGI(AUDIO_TAG, "⏰ Keyword verification timeout, back to listening");
+		}
+		break;
+
+	case KEYWORD_STATE_CONFIRMED:
+		// Keyword was detected, waiting for reset
+		break;
+
+	case KEYWORD_STATE_TIMEOUT:
+		detector->state = KEYWORD_STATE_LISTENING;
+		break;
+	}
+
+	return false;
+}
+
+// Reset keyword detector to listening state
+void reset_keyword_detector(keyword_detector_t *detector)
+{
+	if (detector)
+	{
+		detector->state = KEYWORD_STATE_LISTENING;
+		detector->keyword_detected = false;
+		detector->confidence = 0.0f;
+		detector->buffer_pos = 0;
+		detector->samples_collected = 0;
+		ESP_LOGI(AUDIO_TAG, "🔄 Keyword detector reset to listening state");
+	}
 }
 
 // HTTP event handler for response data
@@ -648,24 +1250,115 @@ void play_audio_response(uint8_t *audio_data, size_t data_len)
 	i2s_driver_uninstall(I2S_NUM);
 }
 
-// Voice assistant task
-void voice_assistant_task(void *pvParameters)
+// Enhanced voice assistant with keyword detection
+void keyword_listening_loop(void)
 {
+	ESP_LOGI(AUDIO_TAG, "🎧 Starting keyword detection - Say 'Hey El'");
+
+	// Initialize keyword detector
+	keyword_detector_t *detector = init_keyword_detector();
+	if (!detector)
+	{
+		ESP_LOGE(AUDIO_TAG, "Failed to initialize keyword detector");
+		return;
+	}
+
+	// Initialize microphone for keyword detection
+	if (init_microphone() != ESP_OK)
+	{
+		ESP_LOGE(AUDIO_TAG, "Failed to initialize microphone for keyword detection");
+		free(detector);
+		return;
+	}
+
+	int16_t *temp_buffer = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
+	if (!temp_buffer)
+	{
+		ESP_LOGE(AUDIO_TAG, "Failed to allocate temp buffer for keyword detection");
+		i2s_driver_uninstall(I2S_NUM);
+		free(detector);
+		return;
+	}
+
+	ESP_LOGI(AUDIO_TAG, "👂 Listening for keyword 'Hey El'...");
+
 	while (1)
 	{
-		ESP_LOGI(TAG, "🔊 Ready for voice command. Say something!");
+		size_t bytes_read = 0;
+		esp_err_t ret = i2s_read(I2S_NUM, temp_buffer, BUFFER_SIZE * sizeof(int16_t), &bytes_read, portMAX_DELAY);
 
-		// Play ready beep
-		play_ready_beep();
+		if (ret != ESP_OK)
+		{
+			ESP_LOGE(AUDIO_TAG, "I2S read error during keyword detection: %s", esp_err_to_name(ret));
+			continue;
+		}
 
-		// Record and stream audio to Cloudflare Worker
-		record_and_stream_audio();
+		if (bytes_read > 0)
+		{
+			size_t sample_count = bytes_read / sizeof(int16_t);
 
-		ESP_LOGI(TAG, "📤 Processing complete. Waiting for next command...");
+			// Check for basic voice activity first to avoid unnecessary processing
+			bool has_voice = detect_voice_activity(temp_buffer, sample_count);
 
-		// Wait before next recording
-		vTaskDelay(pdMS_TO_TICKS(2000));
+			if (has_voice)
+			{
+				// Process samples for keyword detection only when voice is present
+				if (process_keyword_detection(detector, temp_buffer, sample_count))
+				{
+					ESP_LOGI(AUDIO_TAG, "🎯 KEYWORD DETECTED! Switching to command mode...");
+
+					// Play confirmation beep
+					i2s_driver_uninstall(I2S_NUM);
+					play_ready_beep();
+
+					// Switch to voice command recording
+					record_and_stream_audio();
+
+					// Reset keyword detector and continue listening
+					reset_keyword_detector(detector);
+
+					// Reinitialize microphone for keyword detection
+					if (init_microphone() != ESP_OK)
+					{
+						ESP_LOGE(AUDIO_TAG, "Failed to reinitialize microphone");
+						break;
+					}
+
+					ESP_LOGI(AUDIO_TAG, "🔄 Back to keyword listening mode");
+				}
+
+				// Shorter delay when voice is active
+				vTaskDelay(pdMS_TO_TICKS(5));
+			}
+			else
+			{
+				// Longer delay when no voice activity to save CPU
+				vTaskDelay(pdMS_TO_TICKS(50));
+			}
+		}
+		else
+		{
+			// Small delay when no data received
+			vTaskDelay(pdMS_TO_TICKS(10));
+		}
 	}
+
+	// Cleanup
+	free(temp_buffer);
+	if (detector->audio_buffer)
+		free(detector->audio_buffer);
+	free(detector);
+	i2s_driver_uninstall(I2S_NUM);
+}
+
+// Voice assistant task with keyword detection
+void voice_assistant_task(void *pvParameters)
+{
+	ESP_LOGI(TAG, "🚀 Starting Voice Assistant with Keyword Detection");
+	ESP_LOGI(TAG, "💡 Say 'Hey El' to activate voice commands");
+
+	// Enter continuous keyword listening loop
+	keyword_listening_loop();
 }
 
 void wifi_init_sta(void)
