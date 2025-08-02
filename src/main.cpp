@@ -1,42 +1,21 @@
-#include <cstdio>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <M5Unified.h>
+#include <driver/i2s.h>
+#include <esp_heap_caps.h>
 #include <cstring>
-#include <cmath>
-#include <iostream>
 #include <memory>
 #include <vector>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "freertos/queue.h"
-#include "esp_system.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "esp_log.h"
-#include "esp_http_client.h"
-#include "nvs_flash.h"
-#include "lwip/err.h"
-#include "lwip/sys.h"
-#include "driver/i2s.h"
-#include "driver/gpio.h"
-#include "driver/i2c.h"
-#include "esp_heap_caps.h"
-#include "driver/spi_master.h"
-#include "driver/ledc.h"
-#include <M5Unified.h>
-
-// C++ compatibility for ESP-IDF
-extern "C"
-{
-	void app_main(void);
-}
 
 // #define WIFI_SSID "WIFI_NETWORK" // Replace with your WiFi SSID
 // #define WIFI_PASS "PASSWORD1234" // Replace with your WiFi credentials
 
 #define WIFI_MAXIMUM_RETRY 5
 
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT BIT1
+// WiFi status tracking
+bool wifi_connected = false;
 
 // Audio configuration
 #define SAMPLE_RATE 16000
@@ -84,7 +63,7 @@ extern "C"
 #define COLOR_CYAN TFT_CYAN
 #define COLOR_MAGENTA TFT_MAGENTA
 
-static EventGroupHandle_t s_wifi_event_group;
+// Arduino framework already provides ESP_LOG* macros
 
 static const char *TAG = "voice_assistant";
 static const char *AUDIO_TAG = "audio";
@@ -119,7 +98,7 @@ public:
 		if (data_len_ > 0)
 		{
 			audio_data_.reset(new uint8_t[data_len_]);
-			std::memcpy(audio_data_.get(), other.audio_data_.get(), data_len_);
+			memcpy(audio_data_.get(), other.audio_data_.get(), data_len_);
 		}
 	}
 
@@ -139,7 +118,7 @@ public:
 			if (data_len_ > 0)
 			{
 				audio_data_.reset(new uint8_t[data_len_]);
-				std::memcpy(audio_data_.get(), other.audio_data_.get(), data_len_);
+				memcpy(audio_data_.get(), other.audio_data_.get(), data_len_);
 			}
 			else
 			{
@@ -175,8 +154,8 @@ public:
 				std::unique_ptr<uint8_t[]> new_data(new uint8_t[new_len]);
 				if (audio_data_ && data_len_ > 0)
 				{
-					std::memcpy(new_data.get(), audio_data_.get(),
-								std::min(data_len_, new_len));
+					memcpy(new_data.get(), audio_data_.get(),
+								min(data_len_, new_len));
 				}
 				audio_data_ = std::move(new_data);
 			}
@@ -460,36 +439,27 @@ private:
 	}
 };
 
-static void event_handler(void *arg, esp_event_base_t event_base,
-						  int32_t event_id, void *event_data)
-{
-	if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
-	{
-		esp_wifi_connect();
-		show_wifi_status(false); // Show connecting status
+// Arduino-style WiFi connection function
+void connect_wifi() {
+	WiFi.begin(WIFI_SSID, WIFI_PASS);
+	ESP_LOGI(TAG, "Connecting to WiFi...");
+	show_wifi_status(false);
+
+	int retry_count = 0;
+	while (WiFi.status() != WL_CONNECTED && retry_count < WIFI_MAXIMUM_RETRY) {
+		delay(1000);
+		ESP_LOGI(TAG, "WiFi connection attempt %d/%d", retry_count + 1, WIFI_MAXIMUM_RETRY);
+		retry_count++;
 	}
-	else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
-	{
-		show_wifi_status(false); // Show disconnected status
-		if (s_retry_num < WIFI_MAXIMUM_RETRY)
-		{
-			esp_wifi_connect();
-			s_retry_num++;
-			ESP_LOGI(TAG, "retry to connect to the AP");
-		}
-		else
-		{
-			xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-		}
-		ESP_LOGI(TAG, "connect to the AP fail");
-	}
-	else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
-	{
-		ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-		ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-		s_retry_num = 0;
-		show_wifi_status(true); // Show connected status
-		xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+	if (WiFi.status() == WL_CONNECTED) {
+		wifi_connected = true;
+		ESP_LOGI(TAG, "WiFi connected! IP: %s", WiFi.localIP().toString().c_str());
+		show_wifi_status(true);
+	} else {
+		wifi_connected = false;
+		ESP_LOGE(TAG, "WiFi connection failed");
+		show_wifi_status(false);
 	}
 }
 
@@ -664,23 +634,23 @@ void play_ready_beep(void)
 	// Wait for tone to finish playing
 	while (M5.Speaker.isPlaying())
 	{
-		vTaskDelay(1);
+		delay(1);
 	}
-	vTaskDelay(pdMS_TO_TICKS(20));
+	delay(20);
 
 	M5.Speaker.tone(988, 100); // B5 - second note
 	// Wait for tone to finish playing
 	while (M5.Speaker.isPlaying())
 	{
-		vTaskDelay(1);
+		delay(1);
 	}
-	vTaskDelay(pdMS_TO_TICKS(20));
+	delay(20);
 
 	M5.Speaker.tone(1175, 200); // D6 - final note, slightly longer
 	// Wait for tone to finish playing
 	while (M5.Speaker.isPlaying())
 	{
-		vTaskDelay(1);
+		delay(1);
 	}
 
 	ESP_LOGI(AUDIO_TAG, "✅ Beep sequence played using M5.Speaker");
@@ -722,7 +692,7 @@ void update_console_equalizer(int16_t *audio_buffer, size_t samples)
 
 	// Calculate energy for each frequency band (simplified)
 	int samples_per_bar = samples / EQ_BARS;
-	std::string equalizer_line;
+	String equalizer_line;
 	equalizer_line.reserve(EQ_BARS);
 
 	for (int bar = 0; bar < EQ_BARS; bar++)
@@ -907,87 +877,49 @@ bool detect_voice_activity(int16_t *audio_buffer, size_t samples)
 
 // Old C-style functions removed - replaced by KeywordDetector C++ class methods
 
-// HTTP event handler for response data
-esp_err_t http_event_handler(esp_http_client_event_t *evt)
+// Arduino-style HTTP client for sending audio data
+bool stream_audio_chunk(uint8_t *audio_data, size_t data_len, bool is_first_chunk, bool is_last_chunk)
 {
-	switch (evt->event_id)
-	{
-	case HTTP_EVENT_ON_DATA:
-		ESP_LOGI(HTTP_TAG, "Received %d bytes from server", evt->data_len);
-		// Here you could save the audio response data for playback
-		break;
-	case HTTP_EVENT_ON_FINISH:
-		ESP_LOGI(HTTP_TAG, "HTTP request completed");
-		break;
-	case HTTP_EVENT_ERROR:
-		ESP_LOGE(HTTP_TAG, "HTTP error occurred");
-		break;
-	default:
-		break;
+	if (!wifi_connected) {
+		ESP_LOGE(HTTP_TAG, "WiFi not connected");
+		return false;
 	}
-	return ESP_OK;
-}
 
-// Send audio chunk to Cloudflare Worker (streaming)
-esp_err_t stream_audio_chunk(uint8_t *audio_data, size_t data_len, bool is_first_chunk, bool is_last_chunk)
-{
-	esp_http_client_config_t config = {};
-	config.url = WORKER_URL;
-	config.method = HTTP_METHOD_POST;
-	config.event_handler = http_event_handler;
-	config.timeout_ms = 5000;
-
-	esp_http_client_handle_t client = esp_http_client_init(&config);
-	if (!client)
-	{
-		ESP_LOGE(HTTP_TAG, "Failed to initialize HTTP client");
-		return ESP_FAIL;
-	}
+	HTTPClient http;
+	http.begin(WORKER_URL);
 
 	// Set headers
-	esp_http_client_set_header(client, "Content-Type", "audio/pcm");
-	esp_http_client_set_header(client, "User-Agent", "M5Stack-Core2-Assistant");
-	esp_http_client_set_header(client, "X-Audio-Sample-Rate", "16000");
-	esp_http_client_set_header(client, "X-Audio-Channels", "1");
-	esp_http_client_set_header(client, "X-Audio-Bits-Per-Sample", "16");
+	http.addHeader("Content-Type", "audio/pcm");
+	http.addHeader("User-Agent", "M5Stack-Core2-Assistant");
+	http.addHeader("X-Audio-Sample-Rate", "16000");
+	http.addHeader("X-Audio-Channels", "1");
+	http.addHeader("X-Audio-Bits-Per-Sample", "16");
 
 	// Add streaming headers
-	if (is_first_chunk)
-	{
-		esp_http_client_set_header(client, "X-Stream-Start", "true");
+	if (is_first_chunk) {
+		http.addHeader("X-Stream-Start", "true");
 	}
-	if (is_last_chunk)
-	{
-		esp_http_client_set_header(client, "X-Stream-End", "true");
+	if (is_last_chunk) {
+		http.addHeader("X-Stream-End", "true");
 	}
 
-	// Set POST data
-	esp_err_t err = esp_http_client_set_post_field(client, (const char *)audio_data, data_len);
-	if (err != ESP_OK)
-	{
-		ESP_LOGE(HTTP_TAG, "Failed to set POST data: %s", esp_err_to_name(err));
-		esp_http_client_cleanup(client);
-		return err;
+	// Send POST request
+	int httpResponseCode = http.POST(audio_data, data_len);
+
+	if (httpResponseCode > 0) {
+		ESP_LOGI(HTTP_TAG, "Streamed %zu bytes, Status = %d", data_len, httpResponseCode);
+		String response = http.getString();
+		ESP_LOGI(HTTP_TAG, "Response: %s", response.c_str());
+	} else {
+		ESP_LOGE(HTTP_TAG, "HTTP request failed: %d", httpResponseCode);
 	}
 
-	// Perform HTTP request
-	err = esp_http_client_perform(client);
-	if (err == ESP_OK)
-	{
-		int status_code = esp_http_client_get_status_code(client);
-		ESP_LOGI(HTTP_TAG, "Streamed %d bytes, Status = %d", data_len, status_code);
-	}
-	else
-	{
-		ESP_LOGE(HTTP_TAG, "HTTP streaming failed: %s", esp_err_to_name(err));
-	}
-
-	esp_http_client_cleanup(client);
-	return err;
+	http.end();
+	return httpResponseCode > 0;
 }
 
 // Send complete audio data to Cloudflare Worker (non-streaming fallback)
-esp_err_t send_audio_to_worker(uint8_t *audio_data, size_t data_len)
+bool send_audio_to_worker(uint8_t *audio_data, size_t data_len)
 {
 	return stream_audio_chunk(audio_data, data_len, true, true);
 }
@@ -1168,9 +1100,9 @@ void play_audio_response(uint8_t *audio_data, size_t data_len)
 	ESP_LOGI(AUDIO_TAG, "Playing audio response...");
 
 	// Use M5.Speaker to play the audio
-	M5.Speaker.playRAW(audio_data, data_len, SAMPLE_RATE, false);
+	M5.Speaker.playRaw(audio_data, data_len, SAMPLE_RATE, false);
 
-	ESP_LOGI(AUDIO_TAG, "Audio playback completed. Data length: %d", data_len);
+	ESP_LOGI(AUDIO_TAG, "Audio playback completed. Data length: %zu", data_len);
 }
 
 // Enhanced voice assistant with keyword detection
@@ -1282,83 +1214,46 @@ void voice_assistant_task(void *pvParameters)
 	keyword_listening_loop();
 }
 
-void wifi_init_sta(void)
-{
-	s_wifi_event_group = xEventGroupCreate();
+void setup() {
+	// Initialize Serial communication
+	Serial.begin(115200);
+	delay(1000);
 
-	ESP_ERROR_CHECK(esp_netif_init());
+	ESP_LOGI(TAG, "=================================");
+	ESP_LOGI(TAG, "    M5Stack Core2 Voice Assistant");
+	ESP_LOGI(TAG, "=================================");
 
-	ESP_ERROR_CHECK(esp_event_loop_create_default());
-	esp_netif_create_default_wifi_sta();
+	// Initialize M5Stack Core2 hardware using M5Unified
+	ESP_LOGI(TAG, "Initializing M5Stack Core2 hardware...");
+	auto cfg = M5.config();
+	M5.begin(cfg);
 
-	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+	// Show power-on indicator immediately
+	show_power_on_indicator();
+	ESP_LOGI(TAG, "M5Stack Core2 initialized and power indicator shown");
 
-	esp_event_handler_instance_t instance_any_id;
-	esp_event_handler_instance_t instance_got_ip;
-	ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-														ESP_EVENT_ANY_ID,
-														&event_handler,
-														NULL,
-														&instance_any_id));
-	ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-														IP_EVENT_STA_GOT_IP,
-														&event_handler,
-														NULL,
-														&instance_got_ip));
+	// Connect to WiFi
+	connect_wifi();
 
-	wifi_config_t wifi_config = {};
-	strcpy((char *)wifi_config.sta.ssid, WIFI_SSID);
-	strcpy((char *)wifi_config.sta.password, WIFI_PASS);
-	wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-	wifi_config.sta.pmf_cfg.capable = true;
-	wifi_config.sta.pmf_cfg.required = false;
-	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-	ESP_ERROR_CHECK(esp_wifi_start());
+	if (wifi_connected) {
+		ESP_LOGI(TAG, "✅ WiFi connection established. Starting voice assistant...");
+		play_ready_beep(); // Play ready beep sound
 
-	ESP_LOGI(TAG, "wifi_init_sta finished.");
-
-	EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-										   WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-										   pdFALSE,
-										   pdFALSE,
-										   portMAX_DELAY);
-
-	if (bits & WIFI_CONNECTED_BIT)
-	{
-		ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-				 WIFI_SSID, WIFI_PASS);
-	}
-	else if (bits & WIFI_FAIL_BIT)
-	{
-		ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-				 WIFI_SSID, WIFI_PASS);
-	}
-	else
-	{
-		ESP_LOGE(TAG, "UNEXPECTED EVENT");
+		// Start voice assistant in main loop
+		ESP_LOGI(TAG, "🚀 Starting Voice Assistant with Keyword Detection");
+		ESP_LOGI(TAG, "💡 Say 'Hey El' to activate voice commands");
 	}
 }
 
-void app_main(void)
-{
-	ESP_ERROR_CHECK(nvs_flash_init());
-
-	// Initialize system
-	init_system();
-
-	ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
-	wifi_init_sta();
-
-	ESP_LOGI(TAG, "✅ WiFi connection established. Starting voice assistant...");
-
-	// Create voice assistant task with larger stack size
-	xTaskCreate(&voice_assistant_task, "voice_assistant", 16384, NULL, 5, NULL);
-
-	// Main loop - keep app running
-	while (1)
-	{
-		vTaskDelay(1000 / portTICK_PERIOD_MS);
+void loop() {
+	// Main voice assistant loop
+	if (wifi_connected) {
+		keyword_listening_loop();
+	} else {
+		// Try to reconnect WiFi if disconnected
+		delay(5000);
+		connect_wifi();
 	}
+
+	delay(100); // Small delay to prevent watchdog issues
 }
