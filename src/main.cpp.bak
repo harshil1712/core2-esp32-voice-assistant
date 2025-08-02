@@ -1,6 +1,9 @@
-#include <stdio.h>
-#include <string.h>
-#include <math.h>
+#include <cstdio>
+#include <cstring>
+#include <cmath>
+#include <iostream>
+#include <memory>
+#include <vector>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -19,10 +22,17 @@
 #include "esp_heap_caps.h"
 #include "driver/spi_master.h"
 #include "driver/ledc.h"
+#include <M5Unified.h>
+
+// C++ compatibility for ESP-IDF
+extern "C" {
+    void app_main(void);
+}
 
 // #define WIFI_SSID "WIFI_NETWORK" // Replace with your WiFi SSID
 // #define WIFI_PASS "PASSWORD1234" // Replace with your WiFi credentials
-
+#define WIFI_SSID "Vodafone-F1AE"
+#define WIFI_PASS "!9q*Dh*Az%PyqYNe"
 #define WIFI_MAXIMUM_RETRY 5
 
 #define WIFI_CONNECTED_BIT BIT0
@@ -30,7 +40,7 @@
 
 // Audio configuration
 #define SAMPLE_RATE 16000
-#define I2S_NUM (0)
+#define I2S_NUM (i2s_port_t)0
 #define BITS_PER_SAMPLE I2S_BITS_PER_SAMPLE_16BIT
 #define CHANNEL_NUM 1
 #define BUFFER_SIZE 1024
@@ -64,6 +74,16 @@
 
 #define WORKER_URL "https://your-worker.your-subdomain.workers.dev/audio" // Production
 
+// Color definitions for M5GFX (RGB565 format)
+#define COLOR_BLACK TFT_BLACK
+#define COLOR_WHITE TFT_WHITE
+#define COLOR_RED TFT_RED
+#define COLOR_GREEN TFT_GREEN
+#define COLOR_BLUE TFT_BLUE
+#define COLOR_YELLOW TFT_YELLOW
+#define COLOR_CYAN TFT_CYAN
+#define COLOR_MAGENTA TFT_MAGENTA
+
 static EventGroupHandle_t s_wifi_event_group;
 
 // Global I2C initialization flag
@@ -72,13 +92,90 @@ static bool speaker_amplifier_enabled = false;
 static const char *TAG = "voice_assistant";
 static const char *AUDIO_TAG = "audio";
 static const char *HTTP_TAG = "http_client";
+static const char *LCD_TAG = "lcd";
 static int s_retry_num = 0;
 
-typedef struct
-{
-	uint8_t *audio_data;
-	size_t data_len;
-} audio_data_t;
+// Function declarations
+void show_wifi_status(bool connected);
+void show_voice_status(const char* status, uint16_t color);
+esp_err_t init_i2c_master(void);
+
+// C++ AudioData class with RAII
+class AudioData {
+private:
+	std::unique_ptr<uint8_t[]> audio_data_;
+	size_t data_len_;
+
+public:
+	// Constructor
+	AudioData(size_t len = 0) : data_len_(len) {
+		if (len > 0) {
+			audio_data_.reset(new uint8_t[len]);
+		}
+	}
+	
+	// Copy constructor
+	AudioData(const AudioData& other) : data_len_(other.data_len_) {
+		if (data_len_ > 0) {
+			audio_data_.reset(new uint8_t[data_len_]);
+			std::memcpy(audio_data_.get(), other.audio_data_.get(), data_len_);
+		}
+	}
+	
+	// Move constructor
+	AudioData(AudioData&& other) noexcept 
+		: audio_data_(std::move(other.audio_data_)), data_len_(other.data_len_) {
+		other.data_len_ = 0;
+	}
+	
+	// Assignment operators
+	AudioData& operator=(const AudioData& other) {
+		if (this != &other) {
+			data_len_ = other.data_len_;
+			if (data_len_ > 0) {
+				audio_data_.reset(new uint8_t[data_len_]);
+				std::memcpy(audio_data_.get(), other.audio_data_.get(), data_len_);
+			} else {
+				audio_data_.reset();
+			}
+		}
+		return *this;
+	}
+	
+	AudioData& operator=(AudioData&& other) noexcept {
+		if (this != &other) {
+			audio_data_ = std::move(other.audio_data_);
+			data_len_ = other.data_len_;
+			other.data_len_ = 0;
+		}
+		return *this;
+	}
+	
+	// Accessors
+	uint8_t* data() { return audio_data_.get(); }
+	const uint8_t* data() const { return audio_data_.get(); }
+	size_t size() const { return data_len_; }
+	
+	// Resize functionality
+	void resize(size_t new_len) {
+		if (new_len != data_len_) {
+			if (new_len > 0) {
+				std::unique_ptr<uint8_t[]> new_data(new uint8_t[new_len]);
+				if (audio_data_ && data_len_ > 0) {
+					std::memcpy(new_data.get(), audio_data_.get(), 
+							   std::min(data_len_, new_len));
+				}
+				audio_data_ = std::move(new_data);
+			} else {
+				audio_data_.reset();
+			}
+			data_len_ = new_len;
+		}
+	}
+	
+	// Check if empty
+	bool empty() const { return data_len_ == 0 || !audio_data_; }
+};
 
 // Keyword detection states
 typedef enum
@@ -89,17 +186,235 @@ typedef enum
 	KEYWORD_STATE_TIMEOUT	 // Keyword detection timeout
 } keyword_state_t;
 
-// Keyword detection data structure
-typedef struct
-{
-	int16_t *audio_buffer;		// Circular buffer for audio
-	size_t buffer_pos;			// Current position in buffer
-	size_t samples_collected;	// Total samples collected
-	keyword_state_t state;		// Current detection state
-	TickType_t detection_start; // When keyword detection started
-	float confidence;			// Detection confidence score
-	bool keyword_detected;		// Final detection result
-} keyword_detector_t;
+// C++ KeywordDetector class with RAII and better encapsulation
+class KeywordDetector {
+private:
+	std::unique_ptr<int16_t[]> audio_buffer_;	// RAII managed circular buffer
+	size_t buffer_size_;						// Size of the buffer
+	size_t buffer_pos_;							// Current position in buffer
+	size_t samples_collected_;					// Total samples collected
+	keyword_state_t state_;						// Current detection state
+	TickType_t detection_start_;				// When keyword detection started
+	float confidence_;							// Detection confidence score
+	bool keyword_detected_;						// Final detection result
+
+public:
+	// Constructor
+	KeywordDetector(size_t buffer_size = KEYWORD_BUFFER_SIZE) 
+		: buffer_size_(buffer_size), buffer_pos_(0), samples_collected_(0),
+		  state_(KEYWORD_STATE_LISTENING), detection_start_(0),
+		  confidence_(0.0f), keyword_detected_(false) {
+		
+		// Try to allocate in PSRAM first, fall back to regular heap
+		audio_buffer_.reset(static_cast<int16_t*>(
+			heap_caps_malloc(buffer_size_ * sizeof(int16_t), 
+							MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)));
+		
+		if (!audio_buffer_) {
+			audio_buffer_.reset(new int16_t[buffer_size_]);
+		}
+		
+		if (!audio_buffer_) {
+			ESP_LOGE(AUDIO_TAG, "Failed to allocate keyword detector buffer");
+			buffer_size_ = 0;
+		}
+	}
+	
+	// Destructor handled automatically by unique_ptr
+	~KeywordDetector() = default;
+	
+	// Non-copyable but movable
+	KeywordDetector(const KeywordDetector&) = delete;
+	KeywordDetector& operator=(const KeywordDetector&) = delete;
+	
+	KeywordDetector(KeywordDetector&& other) noexcept 
+		: audio_buffer_(std::move(other.audio_buffer_)),
+		  buffer_size_(other.buffer_size_),
+		  buffer_pos_(other.buffer_pos_),
+		  samples_collected_(other.samples_collected_),
+		  state_(other.state_),
+		  detection_start_(other.detection_start_),
+		  confidence_(other.confidence_),
+		  keyword_detected_(other.keyword_detected_) {
+		other.buffer_size_ = 0;
+		other.reset();
+	}
+	
+	KeywordDetector& operator=(KeywordDetector&& other) noexcept {
+		if (this != &other) {
+			audio_buffer_ = std::move(other.audio_buffer_);
+			buffer_size_ = other.buffer_size_;
+			buffer_pos_ = other.buffer_pos_;
+			samples_collected_ = other.samples_collected_;
+			state_ = other.state_;
+			detection_start_ = other.detection_start_;
+			confidence_ = other.confidence_;
+			keyword_detected_ = other.keyword_detected_;
+			
+			other.buffer_size_ = 0;
+			other.reset();
+		}
+		return *this;
+	}
+	
+	// Public interface methods
+	void addSamples(int16_t* samples, size_t count) {
+		if (!samples || !audio_buffer_ || buffer_size_ == 0) return;
+		
+		for (size_t i = 0; i < count; i++) {
+			audio_buffer_[buffer_pos_] = samples[i];
+			buffer_pos_ = (buffer_pos_ + 1) % buffer_size_;
+			
+			if (samples_collected_ < buffer_size_) {
+				samples_collected_++;
+			}
+		}
+	}
+	
+	bool processDetection(int16_t* audio_samples, size_t sample_count) {
+		if (!audio_buffer_) return false;
+		
+		addSamples(audio_samples, sample_count);
+		
+		TickType_t current_time = xTaskGetTickCount();
+		
+		switch (state_) {
+			case KEYWORD_STATE_LISTENING:
+				if (detectKeywordPattern()) {
+					state_ = KEYWORD_STATE_DETECTING;
+					detection_start_ = current_time;
+					ESP_LOGI(AUDIO_TAG, "🎯 Potential keyword detected, verifying...");
+				}
+				break;
+				
+			case KEYWORD_STATE_DETECTING:
+				if (detectKeywordPattern()) {
+					state_ = KEYWORD_STATE_CONFIRMED;
+					keyword_detected_ = true;
+					ESP_LOGI(AUDIO_TAG, "✅ KEYWORD CONFIRMED! Ready for command (confidence: %.3f)", confidence_);
+					return true;
+				}
+				
+				if ((current_time - detection_start_) > pdMS_TO_TICKS(1000)) {
+					state_ = KEYWORD_STATE_LISTENING;
+					ESP_LOGI(AUDIO_TAG, "⏰ Keyword verification timeout, back to listening");
+				}
+				break;
+				
+			case KEYWORD_STATE_CONFIRMED:
+				// Keyword was detected, waiting for reset
+				break;
+				
+			case KEYWORD_STATE_TIMEOUT:
+				state_ = KEYWORD_STATE_LISTENING;
+				break;
+		}
+		
+		return false;
+	}
+	
+	void reset() {
+		state_ = KEYWORD_STATE_LISTENING;
+		keyword_detected_ = false;
+		confidence_ = 0.0f;
+		buffer_pos_ = 0;
+		samples_collected_ = 0;
+		ESP_LOGI(AUDIO_TAG, "🔄 Keyword detector reset to listening state");
+	}
+	
+	// Accessors
+	keyword_state_t getState() const { return state_; }
+	float getConfidence() const { return confidence_; }
+	bool isKeywordDetected() const { return keyword_detected_; }
+	size_t getSamplesCollected() const { return samples_collected_; }
+	bool isValid() const { return audio_buffer_ != nullptr && buffer_size_ > 0; }
+
+private:
+	bool detectKeywordPattern() {
+		if (samples_collected_ < (SAMPLE_RATE * KEYWORD_MIN_LENGTH_MS / 1000)) {
+			return false; // Not enough samples
+		}
+
+		// Get recent audio samples for analysis
+		size_t samples_to_analyze = SAMPLE_RATE * 1; // Analyze 1 second of audio
+		if (samples_to_analyze > samples_collected_) {
+			samples_to_analyze = samples_collected_;
+		}
+
+		// Get samples from circular buffer using RAII
+		std::unique_ptr<int16_t[]> analysis_buffer(new int16_t[samples_to_analyze]);
+		if (!analysis_buffer) return false;
+
+		size_t start_pos = (buffer_pos_ + buffer_size_ - samples_to_analyze) % buffer_size_;
+		for (size_t i = 0; i < samples_to_analyze; i++) {
+			analysis_buffer[i] = audio_buffer_[(start_pos + i) % buffer_size_];
+		}
+
+		// Simple keyword detection: look for sustained voice activity pattern
+		const size_t num_segments = 10;
+		size_t samples_per_segment = samples_to_analyze / num_segments;
+		int active_segments = 0;
+		float total_energy = 0;
+		float segment_energies[10]; // Store individual segment energies
+
+		for (size_t seg = 0; seg < num_segments; seg++) {
+			float segment_energy = 0;
+			size_t start_idx = seg * samples_per_segment;
+			size_t end_idx = (seg + 1) * samples_per_segment;
+
+			for (size_t i = start_idx; i < end_idx && i < samples_to_analyze; i++) {
+				float sample = (float)abs(analysis_buffer[i]) / 32768.0f;
+				segment_energy += sample * sample;
+			}
+
+			segment_energy = segment_energy / samples_per_segment;
+			segment_energies[seg] = segment_energy;
+			total_energy += segment_energy;
+
+			if (segment_energy > 0.001f) { // Lowered threshold
+				active_segments++;
+			}
+		}
+
+		float avg_energy = total_energy / num_segments;
+
+		float energy_variation = 0.0f;
+		if (active_segments > 0) {
+			for (int i = 0; i < num_segments; i++) {
+				float segment_energy = segment_energies[i];
+				energy_variation += fabsf(segment_energy - avg_energy);
+			}
+			energy_variation /= num_segments;
+		}
+
+		// LOWERED THRESHOLDS: Much more permissive detection for "Hey El"
+		bool has_sustained_speech = (active_segments >= 2);
+		bool has_sufficient_energy = (avg_energy > 0.0005f);
+		bool has_variation = (energy_variation > 0.00005f);
+		bool reasonable_duration = (samples_collected_ >= buffer_size_ * 0.1f);
+
+		bool keyword_detected_full = has_sustained_speech && has_sufficient_energy && has_variation && reasonable_duration;
+		bool fallback_detection = (active_segments >= 1) && (avg_energy > 0.0003f) && (samples_collected_ >= buffer_size_ * 0.05f);
+		bool keyword_detected = keyword_detected_full || fallback_detection;
+
+		confidence_ = avg_energy;
+
+		// Enhanced debug logging
+		static int debug_counter = 0;
+		if (++debug_counter % 50 == 0 || keyword_detected || has_sustained_speech) {
+			ESP_LOGI(AUDIO_TAG, "🔍 'Hey El': Segs=%d/10(≥2), Energy=%.4f(>0.0005), Var=%.5f(>0.00005), Dur=%d%%(≥10%%), Det=%s [%s|%s|%s|%s]",
+					 active_segments, avg_energy, energy_variation,
+					 (int)((samples_collected_ * 100) / buffer_size_),
+					 keyword_detected ? "YES" : "NO",
+					 has_sustained_speech ? "S" : "s",
+					 has_sufficient_energy ? "E" : "e",
+					 has_variation ? "V" : "v",
+					 reasonable_duration ? "D" : "d");
+		}
+
+		return keyword_detected;
+	}
+};
 
 static void event_handler(void *arg, esp_event_base_t event_base,
 						  int32_t event_id, void *event_data)
@@ -107,9 +422,11 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 	if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
 	{
 		esp_wifi_connect();
+		show_wifi_status(false); // Show connecting status
 	}
 	else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
 	{
+		show_wifi_status(false); // Show disconnected status
 		if (s_retry_num < WIFI_MAXIMUM_RETRY)
 		{
 			esp_wifi_connect();
@@ -127,33 +444,319 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 		ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
 		ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
 		s_retry_num = 0;
+		show_wifi_status(true); // Show connected status
 		xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+	}
+}
+
+
+
+
+// Manual display functions removed - replaced with M5Unified/M5GFX
+
+// Draw a filled rectangle (simplified version)
+void draw_rectangle(int x, int y, int width, int height, uint16_t color)
+{
+	if (!display_initialized || !spi_display)
+	{
+		ESP_LOGW(LCD_TAG, "Display not initialized, cannot draw rectangle");
+		return;
+	}
+
+	// Bounds checking
+	if (x < 0 || y < 0 || x + width > LCD_WIDTH || y + height > LCD_HEIGHT)
+	{
+		ESP_LOGW(LCD_TAG, "Rectangle out of bounds: (%d,%d) %dx%d", x, y, width, height);
+		return;
+	}
+
+	// Set drawing window
+	lcd_set_window(x, y, x + width - 1, y + height - 1);
+	
+	// Convert color to big-endian bytes
+	uint8_t color_high = (color >> 8) & 0xFF;
+	uint8_t color_low = color & 0xFF;
+	
+	// Fill rectangle pixel by pixel
+	gpio_set_level(LCD_DC_GPIO, 1); // Data mode
+	
+	for (int i = 0; i < width * height; i++)
+	{
+		spi_transaction_t trans = {};
+		trans.length = 16;
+		trans.tx_data[0] = color_high;
+		trans.tx_data[1] = color_low;
+		trans.flags = SPI_TRANS_USE_TXDATA;
+		spi_device_transmit(spi_display, &trans);
+	}
+}
+
+// Draw a simple test rectangle to verify display functionality
+void draw_test_rectangle(void)
+{
+	ESP_LOGI(LCD_TAG, "draw_test_rectangle() called - display_initialized: %s, spi_display: %p", 
+	         display_initialized ? "true" : "false", spi_display);
+	
+	if (!display_initialized || !spi_display)
+	{
+		ESP_LOGW(LCD_TAG, "Display not ready - initialized: %s, spi_display: %p", 
+		         display_initialized ? "true" : "false", spi_display);
+		return;
+	}
+
+	ESP_LOGI(LCD_TAG, "Drawing large visible test pattern...");
+	
+	// First, try to fill entire screen with bright white for maximum visibility
+	ESP_LOGI(LCD_TAG, "Filling entire screen with WHITE for maximum visibility...");
+	lcd_set_window(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1); // Full screen
+	
+	uint8_t white_high = (LCD_COLOR_WHITE >> 8) & 0xFF;
+	uint8_t white_low = LCD_COLOR_WHITE & 0xFF;
+	
+	gpio_set_level(LCD_DC_GPIO, 1); // Data mode
+	for (int i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++)
+	{
+		spi_transaction_t trans = {};
+		trans.length = 16;
+		trans.tx_data[0] = white_high;
+		trans.tx_data[1] = white_low;
+		trans.flags = SPI_TRANS_USE_TXDATA;
+		spi_device_transmit(spi_display, &trans);
+	}
+	
+	ESP_LOGI(LCD_TAG, "Full screen WHITE fill completed, waiting 2 seconds...");
+	vTaskDelay(pdMS_TO_TICKS(2000));
+	
+	// Now try a large red area for contrast
+	ESP_LOGI(LCD_TAG, "Drawing large red rectangle at (50,50)...");
+	lcd_set_window(50, 50, 149, 149); // 100x100 red area
+	
+	uint8_t red_high = (LCD_COLOR_RED >> 8) & 0xFF;
+	uint8_t red_low = LCD_COLOR_RED & 0xFF;
+	
+	gpio_set_level(LCD_DC_GPIO, 1); // Data mode
+	for (int i = 0; i < 100 * 100; i++)
+	{
+		spi_transaction_t trans = {};
+		trans.length = 16;
+		trans.tx_data[0] = red_high;
+		trans.tx_data[1] = red_low;
+		trans.flags = SPI_TRANS_USE_TXDATA;
+		spi_device_transmit(spi_display, &trans);
+	}
+	
+	ESP_LOGI(LCD_TAG, "Large red area drawn, waiting 2 seconds...");
+	vTaskDelay(pdMS_TO_TICKS(2000));
+	
+	// Now try a bright color - try both RGB orders
+	ESP_LOGI(LCD_TAG, "Testing bright colors at different positions...");
+	
+	// Test 1: Pure red at (100,100) - reuse existing red variables
+	lcd_set_window(100, 100, 109, 109); // 10x10 red
+	ESP_LOGI(LCD_TAG, "Red (0x%04X): 0x%02X 0x%02X", LCD_COLOR_RED, red_high, red_low);
+	
+	gpio_set_level(LCD_DC_GPIO, 1);
+	for (int i = 0; i < 10 * 10; i++)
+	{
+		spi_transaction_t trans = {};
+		trans.length = 16;
+		trans.tx_data[0] = red_high;
+		trans.tx_data[1] = red_low;
+		trans.flags = SPI_TRANS_USE_TXDATA;
+		spi_device_transmit(spi_display, &trans);
+	}
+	
+	// Test 2: Pure green at (120,100)
+	lcd_set_window(120, 100, 129, 109); // 10x10 green
+	uint8_t green_high = (LCD_COLOR_GREEN >> 8) & 0xFF;
+	uint8_t green_low = LCD_COLOR_GREEN & 0xFF;
+	ESP_LOGI(LCD_TAG, "Green (0x%04X): 0x%02X 0x%02X", LCD_COLOR_GREEN, green_high, green_low);
+	
+	gpio_set_level(LCD_DC_GPIO, 1);
+	for (int i = 0; i < 10 * 10; i++)
+	{
+		spi_transaction_t trans = {};
+		trans.length = 16;
+		trans.tx_data[0] = green_high;
+		trans.tx_data[1] = green_low;
+		trans.flags = SPI_TRANS_USE_TXDATA;
+		spi_device_transmit(spi_display, &trans);
+	}
+	
+	// Test 3: Pure blue at (140,100)
+	lcd_set_window(140, 100, 149, 109); // 10x10 blue
+	uint8_t blue_high = (LCD_COLOR_BLUE >> 8) & 0xFF;
+	uint8_t blue_low = LCD_COLOR_BLUE & 0xFF;
+	ESP_LOGI(LCD_TAG, "Blue (0x%04X): 0x%02X 0x%02X", LCD_COLOR_BLUE, blue_high, blue_low);
+	
+	gpio_set_level(LCD_DC_GPIO, 1);
+	for (int i = 0; i < 10 * 10; i++)
+	{
+		spi_transaction_t trans = {};
+		trans.length = 16;
+		trans.tx_data[0] = blue_high;
+		trans.tx_data[1] = blue_low;
+		trans.flags = SPI_TRANS_USE_TXDATA;
+		spi_device_transmit(spi_display, &trans);
+	}
+	
+	// Test 4: White at (160,100) - reuse existing white variables
+	lcd_set_window(160, 100, 169, 109); // 10x10 white
+	ESP_LOGI(LCD_TAG, "White (0x%04X): 0x%02X 0x%02X", LCD_COLOR_WHITE, white_high, white_low);
+	
+	gpio_set_level(LCD_DC_GPIO, 1);
+	for (int i = 0; i < 10 * 10; i++)
+	{
+		spi_transaction_t trans = {};
+		trans.length = 16;
+		trans.tx_data[0] = white_high;
+		trans.tx_data[1] = white_low;
+		trans.flags = SPI_TRANS_USE_TXDATA;
+		spi_device_transmit(spi_display, &trans);
+	}
+	
+	ESP_LOGI(LCD_TAG, "Test rectangle drawn successfully");
+}
+
+// Draw a simple power-on indicator
+void show_power_on_indicator(void)
+{
+	if (!display_initialized)
+	{
+		ESP_LOGW(LCD_TAG, "Display not initialized, cannot show power indicator");
+		return;
+	}
+
+	ESP_LOGI(LCD_TAG, "Displaying power-on indicator");
+
+	// Start with a simple test rectangle
+	ESP_LOGI(LCD_TAG, "About to call draw_test_rectangle()...");
+	draw_test_rectangle();
+	ESP_LOGI(LCD_TAG, "draw_test_rectangle() completed");
+	
+	// If test rectangle works, proceed with more complex graphics
+	ESP_LOGI(LCD_TAG, "Waiting 1 second before drawing power indicator...");
+	vTaskDelay(pdMS_TO_TICKS(1000)); // Wait 1 second to see test rectangle
+	
+	// Draw a simple green rectangle in the center as power indicator
+	ESP_LOGI(LCD_TAG, "Drawing power indicator rectangles...");
+	int center_x = LCD_WIDTH / 2;
+	int center_y = LCD_HEIGHT / 2;
+
+	// Draw a simple green square as power indicator (smaller and simpler)
+	draw_rectangle(center_x - 30, center_y - 30, 60, 60, LCD_COLOR_GREEN);
+
+	ESP_LOGI(LCD_TAG, "Power-on indicator displayed");
+}
+
+// Show WiFi status on display
+void show_wifi_status(bool connected)
+{
+	if (!display_initialized)
+	{
+		ESP_LOGI(LCD_TAG, "Display not ready yet, WiFi status: %s", connected ? "Connected" : "Connecting...");
+		return;
+	}
+
+	ESP_LOGI(LCD_TAG, "Updating WiFi status: %s", connected ? "Connected" : "Connecting...");
+
+	// WiFi indicator position (top-right corner)
+	int wifi_x = LCD_WIDTH - 60;
+	int wifi_y = 10;
+	int wifi_width = 50;
+	int wifi_height = 20;
+
+	// Clear the WiFi status area
+	draw_rectangle(wifi_x, wifi_y, wifi_width, wifi_height, LCD_COLOR_BLACK);
+
+	if (connected)
+	{
+		// Draw connected indicator (green bars representing WiFi signal)
+		draw_rectangle(wifi_x + 5, wifi_y + 15, 8, 5, LCD_COLOR_GREEN);   // Bar 1
+		draw_rectangle(wifi_x + 15, wifi_y + 12, 8, 8, LCD_COLOR_GREEN);  // Bar 2
+		draw_rectangle(wifi_x + 25, wifi_y + 8, 8, 12, LCD_COLOR_GREEN);  // Bar 3
+		draw_rectangle(wifi_x + 35, wifi_y + 5, 8, 15, LCD_COLOR_GREEN);  // Bar 4
+	}
+	else
+	{
+		// Draw connecting indicator (yellow/orange bars)
+		draw_rectangle(wifi_x + 5, wifi_y + 15, 8, 5, LCD_COLOR_YELLOW);
+		draw_rectangle(wifi_x + 15, wifi_y + 12, 8, 8, LCD_COLOR_YELLOW);
+		draw_rectangle(wifi_x + 25, wifi_y + 8, 8, 12, LCD_COLOR_YELLOW);
+		// Draw X for disconnected
+		draw_rectangle(wifi_x + 35, wifi_y + 5, 2, 15, LCD_COLOR_RED);
+		draw_rectangle(wifi_x + 41, wifi_y + 5, 2, 15, LCD_COLOR_RED);
+	}
+}
+
+// Show voice assistant status
+void show_voice_status(const char* status, uint16_t color)
+{
+	if (!display_initialized)
+	{
+		ESP_LOGW(LCD_TAG, "Display not initialized, cannot show voice status");
+		return;
+	}
+
+	ESP_LOGI(LCD_TAG, "Updating voice status: %s", status);
+
+	// Status indicator position (bottom center)
+	int status_x = LCD_WIDTH / 2 - 60;
+	int status_y = LCD_HEIGHT - 40;
+	int status_width = 120;
+	int status_height = 30;
+
+	// Clear the status area
+	draw_rectangle(status_x, status_y, status_width, status_height, LCD_COLOR_BLACK);
+
+	// Draw status indicator
+	if (strcmp(status, "LISTENING") == 0)
+	{
+		// Draw ear icon (simple representation)
+		draw_rectangle(status_x + 20, status_y + 5, 20, 20, color);
+		draw_rectangle(status_x + 25, status_y + 10, 10, 10, LCD_COLOR_BLACK); // Inner ear
+		draw_rectangle(status_x + 50, status_y + 12, 30, 6, color); // "LISTENING" text bar
+	}
+	else if (strcmp(status, "PROCESSING") == 0)
+	{
+		// Draw processing dots
+		for (int i = 0; i < 5; i++)
+		{
+			draw_rectangle(status_x + 20 + (i * 15), status_y + 10, 8, 8, color);
+		}
+	}
+	else if (strcmp(status, "RESPONDING") == 0)
+	{
+		// Draw speaker icon
+		draw_rectangle(status_x + 25, status_y + 8, 15, 15, color);
+		draw_rectangle(status_x + 42, status_y + 5, 3, 20, color); // Sound wave 1
+		draw_rectangle(status_x + 47, status_y + 3, 3, 24, color); // Sound wave 2
+		draw_rectangle(status_x + 52, status_y + 1, 3, 28, color); // Sound wave 3
 	}
 }
 
 // Audio initialization for PDM microphone (recording)
 esp_err_t init_microphone(void)
 {
-	i2s_config_t i2s_config = {
-		.mode = I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM,
-		.sample_rate = SAMPLE_RATE,
-		.bits_per_sample = BITS_PER_SAMPLE,
-		.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-		.communication_format = I2S_COMM_FORMAT_STAND_I2S,
-		.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-		.dma_buf_count = 8,
-		.dma_buf_len = BUFFER_SIZE,
-		.use_apll = false,
-		.tx_desc_auto_clear = false,
-		.fixed_mclk = 0};
+	i2s_config_t i2s_config = {};
+	i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM);
+	i2s_config.sample_rate = SAMPLE_RATE;
+	i2s_config.bits_per_sample = BITS_PER_SAMPLE;
+	i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+	i2s_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+	i2s_config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+	i2s_config.dma_buf_count = 8;
+	i2s_config.dma_buf_len = BUFFER_SIZE;
+	i2s_config.use_apll = false;
+	i2s_config.tx_desc_auto_clear = false;
+	i2s_config.fixed_mclk = 0;
 
 	// M5Stack Core2 PDM microphone pins (typical configuration)
-	i2s_pin_config_t pin_config = {
-		.bck_io_num = I2S_PIN_NO_CHANGE,
-		.ws_io_num = GPIO_NUM_0, // PDM CLK
-		.data_out_num = I2S_PIN_NO_CHANGE,
-		.data_in_num = GPIO_NUM_34, // PDM DATA
-	};
+	i2s_pin_config_t pin_config = {};
+	pin_config.bck_io_num = I2S_PIN_NO_CHANGE;
+	pin_config.ws_io_num = GPIO_NUM_0; // PDM CLK
+	pin_config.data_out_num = I2S_PIN_NO_CHANGE;
+	pin_config.data_in_num = GPIO_NUM_34; // PDM DATA
 
 	esp_err_t ret = i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
 	if (ret != ESP_OK)
@@ -185,14 +788,13 @@ esp_err_t init_i2c_master(void)
 
 	ESP_LOGI(AUDIO_TAG, "🔧 Initializing I2C master for AXP192 (first time)...");
 
-	i2c_config_t conf = {
-		.mode = I2C_MODE_MASTER,
-		.sda_io_num = I2C_MASTER_SDA_IO,
-		.sda_pullup_en = GPIO_PULLUP_ENABLE,
-		.scl_io_num = I2C_MASTER_SCL_IO,
-		.scl_pullup_en = GPIO_PULLUP_ENABLE,
-		.master.clk_speed = I2C_MASTER_FREQ_HZ,
-	};
+	i2c_config_t conf = {};
+	conf.mode = I2C_MODE_MASTER;
+	conf.sda_io_num = I2C_MASTER_SDA_IO;
+	conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+	conf.scl_io_num = I2C_MASTER_SCL_IO;
+	conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+	conf.master.clk_speed = I2C_MASTER_FREQ_HZ;
 
 	esp_err_t ret = i2c_param_config(I2C_MASTER_NUM, &conf);
 	if (ret != ESP_OK)
@@ -303,26 +905,24 @@ esp_err_t init_speaker(void)
 	// Add delay to ensure clean driver state transition
 	vTaskDelay(pdMS_TO_TICKS(100));
 
-	i2s_config_t i2s_config = {
-		.mode = I2S_MODE_MASTER | I2S_MODE_TX,
-		.sample_rate = SAMPLE_RATE,
-		.bits_per_sample = BITS_PER_SAMPLE,
-		.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-		.communication_format = I2S_COMM_FORMAT_STAND_I2S,
-		.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-		.dma_buf_count = 8,
-		.dma_buf_len = BUFFER_SIZE,
-		.use_apll = false,
-		.tx_desc_auto_clear = true,
-	};
+	i2s_config_t i2s_config = {};
+	i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+	i2s_config.sample_rate = SAMPLE_RATE;
+	i2s_config.bits_per_sample = BITS_PER_SAMPLE;
+	i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+	i2s_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+	i2s_config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+	i2s_config.dma_buf_count = 8;
+	i2s_config.dma_buf_len = BUFFER_SIZE;
+	i2s_config.use_apll = false;
+	i2s_config.tx_desc_auto_clear = true;
 
 	// M5Stack Core2 I2S speaker pins
-	i2s_pin_config_t pin_config = {
-		.bck_io_num = GPIO_NUM_12,	// BCLK
-		.ws_io_num = GPIO_NUM_0,	// LRCK
-		.data_out_num = GPIO_NUM_2, // DOUT
-		.data_in_num = I2S_PIN_NO_CHANGE,
-	};
+	i2s_pin_config_t pin_config = {};
+	pin_config.bck_io_num = GPIO_NUM_12;	// BCLK
+	pin_config.ws_io_num = GPIO_NUM_0;	// LRCK
+	pin_config.data_out_num = GPIO_NUM_2; // DOUT
+	pin_config.data_in_num = I2S_PIN_NO_CHANGE;
 
 	esp_err_t ret = i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
 	if (ret != ESP_OK)
@@ -352,12 +952,29 @@ esp_err_t init_speaker(void)
 	return ESP_OK;
 }
 
-// Initialize system (console-based for now)
+// Initialize system with display
 void init_system(void)
 {
 	ESP_LOGI(TAG, "=================================");
 	ESP_LOGI(TAG, "    M5Stack Core2 Voice Assistant");
 	ESP_LOGI(TAG, "=================================");
+
+	// Initialize display first to show visual feedback
+	ESP_LOGI(TAG, "Initializing display...");
+	if (init_display() == ESP_OK)
+	{
+		// Show power-on indicator immediately
+		show_power_on_indicator();
+		ESP_LOGI(TAG, "Display initialized and power indicator shown");
+		
+		// Initialize WiFi status indicator (initially disconnected)
+		show_wifi_status(false);
+	}
+	else
+	{
+		ESP_LOGW(TAG, "Display initialization failed, continuing without display");
+	}
+
 	ESP_LOGI(TAG, "Connecting to WiFi...");
 }
 
@@ -382,7 +999,7 @@ void play_ready_beep(void)
 	const int beep_duration_ms = 500;			// Longer duration for better audibility
 	const int total_samples = (SAMPLE_RATE * beep_duration_ms) / 1000;
 
-	int16_t *beep_buffer = (int16_t *)malloc(total_samples * sizeof(int16_t));
+	std::unique_ptr<int16_t[]> beep_buffer(new int16_t[total_samples]);
 	if (!beep_buffer)
 	{
 		ESP_LOGE(AUDIO_TAG, "❌ Failed to allocate beep buffer");
@@ -428,7 +1045,7 @@ void play_ready_beep(void)
 
 	size_t bytes_written = 0;
 	size_t expected_bytes = total_samples * sizeof(int16_t);
-	esp_err_t ret = i2s_write(I2S_NUM, beep_buffer, expected_bytes, &bytes_written, pdMS_TO_TICKS(2000));
+	esp_err_t ret = i2s_write(I2S_NUM, beep_buffer.get(), expected_bytes, &bytes_written, pdMS_TO_TICKS(2000));
 
 	if (ret == ESP_OK)
 	{
@@ -454,7 +1071,7 @@ void play_ready_beep(void)
 	ESP_LOGI(AUDIO_TAG, "🔍 Checking DMA buffer status...");
 	i2s_zero_dma_buffer(I2S_NUM); // Clear any remaining data
 
-	free(beep_buffer);
+	// RAII: beep_buffer automatically freed when going out of scope
 
 	// Clean driver shutdown
 	esp_err_t uninstall_ret = i2s_driver_uninstall(I2S_NUM);
@@ -481,7 +1098,8 @@ void update_console_equalizer(int16_t *audio_buffer, size_t samples)
 
 	// Calculate energy for each frequency band (simplified)
 	int samples_per_bar = samples / EQ_BARS;
-	char equalizer_line[EQ_BARS + 10];
+	std::string equalizer_line;
+	equalizer_line.reserve(EQ_BARS);
 
 	for (int bar = 0; bar < EQ_BARS; bar++)
 	{
@@ -504,16 +1122,14 @@ void update_console_equalizer(int16_t *audio_buffer, size_t samples)
 
 		// Create visual bar
 		if (bar_height >= 4)
-			equalizer_line[bar] = '#'; // High
+			equalizer_line += '#'; // High
 		else if (bar_height >= 2)
-			equalizer_line[bar] = '|'; // Medium
+			equalizer_line += '|'; // Medium
 		else if (bar_height >= 1)
-			equalizer_line[bar] = '.'; // Low
+			equalizer_line += '.'; // Low
 		else
-			equalizer_line[bar] = ' '; // Silent
+			equalizer_line += ' '; // Silent
 	}
-
-	equalizer_line[EQ_BARS] = '\0';
 
 	// Calculate total audio level
 	int64_t total_energy = 0;
@@ -525,7 +1141,7 @@ void update_console_equalizer(int16_t *audio_buffer, size_t samples)
 
 	// Display console equalizer and status
 	ESP_LOGI(AUDIO_TAG, "EQ: [%s] Level: %d %s",
-			 equalizer_line,
+			 equalizer_line.c_str(),
 			 avg_level,
 			 "👂 Listening...");
 }
@@ -663,306 +1279,9 @@ bool detect_voice_activity(int16_t *audio_buffer, size_t samples)
 	return voice_detected;
 }
 
-// Initialize keyword detector
-keyword_detector_t *init_keyword_detector(void)
-{
-	keyword_detector_t *detector = (keyword_detector_t *)malloc(sizeof(keyword_detector_t));
-	if (!detector)
-	{
-		ESP_LOGE(AUDIO_TAG, "Failed to allocate keyword detector");
-		return NULL;
-	}
+// Old C-style function removed - replaced by KeywordDetector constructor
 
-	// Allocate audio buffer in PSRAM for better performance
-	detector->audio_buffer = (int16_t *)heap_caps_malloc(KEYWORD_BUFFER_SIZE * sizeof(int16_t),
-														 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-	if (!detector->audio_buffer)
-	{
-		detector->audio_buffer = (int16_t *)malloc(KEYWORD_BUFFER_SIZE * sizeof(int16_t));
-	}
-
-	if (!detector->audio_buffer)
-	{
-		ESP_LOGE(AUDIO_TAG, "Failed to allocate keyword audio buffer");
-		free(detector);
-		return NULL;
-	}
-
-	// Initialize detector state
-	detector->buffer_pos = 0;
-	detector->samples_collected = 0;
-	detector->state = KEYWORD_STATE_LISTENING;
-	detector->detection_start = 0;
-	detector->confidence = 0.0f;
-	detector->keyword_detected = false;
-
-	ESP_LOGI(AUDIO_TAG, "Keyword detector initialized with %d sample buffer", KEYWORD_BUFFER_SIZE);
-	return detector;
-}
-
-// Add audio sample to keyword detector
-void keyword_detector_add_samples(keyword_detector_t *detector, int16_t *samples, size_t count)
-{
-	if (!detector || !samples)
-		return;
-
-	for (size_t i = 0; i < count; i++)
-	{
-		// Add to circular buffer
-		detector->audio_buffer[detector->buffer_pos] = samples[i];
-		detector->buffer_pos = (detector->buffer_pos + 1) % KEYWORD_BUFFER_SIZE;
-
-		if (detector->samples_collected < KEYWORD_BUFFER_SIZE)
-		{
-			detector->samples_collected++;
-		}
-	}
-}
-
-// Simplified keyword detection based on voice activity patterns
-bool detect_keyword_pattern(keyword_detector_t *detector)
-{
-	if (detector->samples_collected < (SAMPLE_RATE * KEYWORD_MIN_LENGTH_MS / 1000))
-	{
-		return false; // Not enough samples
-	}
-
-	// Get recent audio samples for analysis
-	size_t samples_to_analyze = SAMPLE_RATE * 1; // Analyze 1 second of audio
-	if (samples_to_analyze > detector->samples_collected)
-	{
-		samples_to_analyze = detector->samples_collected;
-	}
-
-	// Get samples from circular buffer
-	int16_t *analysis_buffer = (int16_t *)malloc(samples_to_analyze * sizeof(int16_t));
-	if (!analysis_buffer)
-		return false;
-
-	size_t start_pos = (detector->buffer_pos + KEYWORD_BUFFER_SIZE - samples_to_analyze) % KEYWORD_BUFFER_SIZE;
-	for (size_t i = 0; i < samples_to_analyze; i++)
-	{
-		analysis_buffer[i] = detector->audio_buffer[(start_pos + i) % KEYWORD_BUFFER_SIZE];
-	}
-
-	// Simple keyword detection: look for sustained voice activity pattern
-	// Calculate energy in segments to detect speech patterns
-	const size_t num_segments = 10;
-	size_t samples_per_segment = samples_to_analyze / num_segments;
-	int active_segments = 0;
-	float total_energy = 0;
-	float segment_energies[10]; // Store individual segment energies
-
-	for (size_t seg = 0; seg < num_segments; seg++)
-	{
-		float segment_energy = 0;
-		size_t start_idx = seg * samples_per_segment;
-		size_t end_idx = (seg + 1) * samples_per_segment;
-
-		for (size_t i = start_idx; i < end_idx && i < samples_to_analyze; i++)
-		{
-			float sample = (float)abs(analysis_buffer[i]) / 32768.0f;
-			segment_energy += sample * sample;
-		}
-
-		segment_energy = segment_energy / samples_per_segment;
-		segment_energies[seg] = segment_energy; // Store for variation calculation
-		total_energy += segment_energy;
-
-		// Consider segment "active" if it has significant energy
-		if (segment_energy > 0.001f)
-		{ // Lowered threshold
-			active_segments++;
-		}
-	}
-
-	float avg_energy = total_energy / num_segments;
-
-	// Enhanced keyword detection for "Hey El" - looking for specific patterns:
-	// 1. Must have sustained speech (30% active segments - shorter phrase)
-	// 2. Must have sufficient energy above background
-	// 3. Must have energy variation (not just noise)
-	// 4. Must last for reasonable duration (~0.3 seconds minimum for "Hey El")
-
-	float energy_variation = 0.0f;
-	if (active_segments > 0)
-	{
-		// Calculate energy variation across segments
-		for (int i = 0; i < num_segments; i++)
-		{
-			float segment_energy = segment_energies[i];
-			energy_variation += fabsf(segment_energy - avg_energy);
-		}
-		energy_variation /= num_segments;
-	}
-
-	// LOWERED THRESHOLDS: Much more permissive detection for "Hey El"
-	bool has_sustained_speech = (active_segments >= 2);										// 20% of segments active (very lenient)
-	bool has_sufficient_energy = (avg_energy > 0.0005f);									// Much lower threshold, closer to background
-	bool has_variation = (energy_variation > 0.00005f);										// Very low variation threshold
-	bool reasonable_duration = (detector->samples_collected >= KEYWORD_BUFFER_SIZE * 0.1f); // 10% of buffer (0.2s minimum)
-
-	// Additional pattern recognition for "Hey El" (two-syllable phrase)
-	bool has_two_syllable_pattern = false;
-	if (has_sustained_speech && has_sufficient_energy)
-	{
-		// Look for two energy peaks characteristic of "Hey" + "El"
-		// Find segments with highest energy (representing syllables)
-		float peak_threshold = avg_energy * 1.2f; // 20% above average
-		int peak_count = 0;
-		int first_peak = -1, last_peak = -1;
-
-		for (int i = 0; i < num_segments; i++)
-		{
-			if (segment_energies[i] > peak_threshold)
-			{
-				peak_count++;
-				if (first_peak == -1)
-					first_peak = i;
-				last_peak = i;
-			}
-		}
-
-		// "Hey El" should have 1-3 peak segments with reasonable spacing
-		if (peak_count >= 1 && peak_count <= 4)
-		{
-			int peak_span = (last_peak - first_peak) + 1;
-			// Peaks should span 2-6 segments (reasonable for short phrase)
-			has_two_syllable_pattern = (peak_span >= 2 && peak_span <= 6);
-		}
-	}
-
-	// Multi-level detection logic with fallback
-	bool keyword_detected_full = has_sustained_speech && has_sufficient_energy && has_variation && reasonable_duration;
-
-	// Fallback: Super simple detection for any significant voice activity
-	bool fallback_detection = (active_segments >= 1) && (avg_energy > 0.0003f) &&
-							  (detector->samples_collected >= KEYWORD_BUFFER_SIZE * 0.05f); // Just 0.1s of any voice
-
-	// Use either full criteria OR fallback (for testing)
-	bool keyword_detected = keyword_detected_full || fallback_detection;
-
-	// DEBUG: Show which detection method triggered
-	if (keyword_detected && !keyword_detected_full)
-	{
-		ESP_LOGI(AUDIO_TAG, "🎯 FALLBACK detection triggered! (not full criteria)");
-	}
-
-	detector->confidence = avg_energy;
-
-	// Enhanced debug logging with detailed failure analysis
-	static int debug_counter = 0;
-	if (++debug_counter % 50 == 0 || keyword_detected || has_sustained_speech) // More frequent logging when voice detected
-	{
-		ESP_LOGI(AUDIO_TAG, "🔍 'Hey El': Segs=%d/10(≥2), Energy=%.4f(>0.0005), Var=%.5f(>0.00005), Dur=%d%%(≥10%%), Det=%s [%s|%s|%s|%s|%s]",
-				 active_segments, avg_energy, energy_variation,
-				 (int)((detector->samples_collected * 100) / KEYWORD_BUFFER_SIZE),
-				 keyword_detected ? "YES" : "NO",
-				 has_sustained_speech ? "S" : "s",
-				 has_sufficient_energy ? "E" : "e",
-				 has_variation ? "V" : "v",
-				 reasonable_duration ? "D" : "d",
-				 has_two_syllable_pattern ? "P" : "p");
-
-		// Additional pattern analysis debug when voice is detected
-		if (has_sustained_speech)
-		{
-			float peak_threshold = avg_energy * 1.2f;
-			int peak_count = 0;
-			int first_peak = -1, last_peak = -1;
-
-			for (int i = 0; i < num_segments; i++)
-			{
-				if (segment_energies[i] > peak_threshold)
-				{
-					peak_count++;
-					if (first_peak == -1)
-						first_peak = i;
-					last_peak = i;
-				}
-			}
-
-			if (peak_count > 0)
-			{
-				int peak_span = (last_peak - first_peak) + 1;
-				ESP_LOGI(AUDIO_TAG, "   📊 Pattern: PeakCount=%d(1-4), PeakSpan=%d(2-6), Threshold=%.4f",
-						 peak_count, peak_span, peak_threshold);
-			}
-		}
-	}
-
-	free(analysis_buffer);
-
-	return keyword_detected;
-}
-
-// Main keyword detection function
-bool process_keyword_detection(keyword_detector_t *detector, int16_t *audio_samples, size_t sample_count)
-{
-	if (!detector)
-		return false;
-
-	// Add new samples to detector
-	keyword_detector_add_samples(detector, audio_samples, sample_count);
-
-	TickType_t current_time = xTaskGetTickCount();
-
-	switch (detector->state)
-	{
-	case KEYWORD_STATE_LISTENING:
-		// Look for keyword pattern
-		if (detect_keyword_pattern(detector))
-		{
-			detector->state = KEYWORD_STATE_DETECTING;
-			detector->detection_start = current_time;
-			ESP_LOGI(AUDIO_TAG, "🎯 Potential keyword detected, verifying...");
-		}
-		break;
-
-	case KEYWORD_STATE_DETECTING:
-		// Verify keyword over a short period
-		if (detect_keyword_pattern(detector))
-		{
-			detector->state = KEYWORD_STATE_CONFIRMED;
-			detector->keyword_detected = true;
-			ESP_LOGI(AUDIO_TAG, "✅ KEYWORD CONFIRMED! Ready for command (confidence: %.3f)",
-					 detector->confidence);
-			return true;
-		}
-
-		// Check timeout
-		if ((current_time - detector->detection_start) > pdMS_TO_TICKS(1000))
-		{
-			detector->state = KEYWORD_STATE_LISTENING;
-			ESP_LOGI(AUDIO_TAG, "⏰ Keyword verification timeout, back to listening");
-		}
-		break;
-
-	case KEYWORD_STATE_CONFIRMED:
-		// Keyword was detected, waiting for reset
-		break;
-
-	case KEYWORD_STATE_TIMEOUT:
-		detector->state = KEYWORD_STATE_LISTENING;
-		break;
-	}
-
-	return false;
-}
-
-// Reset keyword detector to listening state
-void reset_keyword_detector(keyword_detector_t *detector)
-{
-	if (detector)
-	{
-		detector->state = KEYWORD_STATE_LISTENING;
-		detector->keyword_detected = false;
-		detector->confidence = 0.0f;
-		detector->buffer_pos = 0;
-		detector->samples_collected = 0;
-		ESP_LOGI(AUDIO_TAG, "🔄 Keyword detector reset to listening state");
-	}
-}
+// Old C-style functions removed - replaced by KeywordDetector C++ class methods
 
 // HTTP event handler for response data
 esp_err_t http_event_handler(esp_http_client_event_t *evt)
@@ -988,12 +1307,11 @@ esp_err_t http_event_handler(esp_http_client_event_t *evt)
 // Send audio chunk to Cloudflare Worker (streaming)
 esp_err_t stream_audio_chunk(uint8_t *audio_data, size_t data_len, bool is_first_chunk, bool is_last_chunk)
 {
-	esp_http_client_config_t config = {
-		.url = WORKER_URL,
-		.method = HTTP_METHOD_POST,
-		.event_handler = http_event_handler,
-		.timeout_ms = 5000,
-	};
+	esp_http_client_config_t config = {};
+	config.url = WORKER_URL;
+	config.method = HTTP_METHOD_POST;
+	config.event_handler = http_event_handler;
+	config.timeout_ms = 5000;
 
 	esp_http_client_handle_t client = esp_http_client_init(&config);
 	if (!client)
@@ -1054,6 +1372,7 @@ esp_err_t send_audio_to_worker(uint8_t *audio_data, size_t data_len)
 void record_and_stream_audio(void)
 {
 	ESP_LOGI(AUDIO_TAG, "Starting real-time audio streaming...");
+	show_voice_status("RESPONDING", LCD_COLOR_GREEN);
 
 	// Check available heap memory
 	size_t free_heap = esp_get_free_heap_size();
@@ -1072,17 +1391,13 @@ void record_and_stream_audio(void)
 		return;
 	}
 
-	// Smaller buffers for streaming
-	int16_t *temp_buffer = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
-	uint8_t *stream_buffer = (uint8_t *)malloc(STREAM_CHUNK_SIZE);
+	// Smaller buffers for streaming using RAII
+	std::unique_ptr<int16_t[]> temp_buffer(new int16_t[BUFFER_SIZE]);
+	std::unique_ptr<uint8_t[]> stream_buffer(new uint8_t[STREAM_CHUNK_SIZE]);
 
 	if (!temp_buffer || !stream_buffer)
 	{
 		ESP_LOGE(AUDIO_TAG, "Failed to allocate memory for streaming. Free heap: %d", esp_get_free_heap_size());
-		if (temp_buffer)
-			free(temp_buffer);
-		if (stream_buffer)
-			free(stream_buffer);
 		i2s_driver_uninstall(I2S_NUM);
 		return;
 	}
@@ -1102,7 +1417,7 @@ void record_and_stream_audio(void)
 
 	while (1)
 	{
-		esp_err_t ret = i2s_read(I2S_NUM, temp_buffer, BUFFER_SIZE * sizeof(int16_t), &bytes_read, portMAX_DELAY);
+		esp_err_t ret = i2s_read(I2S_NUM, temp_buffer.get(), BUFFER_SIZE * sizeof(int16_t), &bytes_read, portMAX_DELAY);
 
 		if (ret != ESP_OK)
 		{
@@ -1112,7 +1427,7 @@ void record_and_stream_audio(void)
 
 		if (bytes_read > 0)
 		{
-			bool voice_detected = detect_voice_activity(temp_buffer, bytes_read / sizeof(int16_t));
+			bool voice_detected = detect_voice_activity(temp_buffer.get(), bytes_read / sizeof(int16_t));
 
 			if (voice_detected)
 			{
@@ -1149,7 +1464,7 @@ void record_and_stream_audio(void)
 					bytes_to_copy = STREAM_CHUNK_SIZE - stream_buffer_pos;
 				}
 
-				memcpy(stream_buffer + stream_buffer_pos, temp_buffer, bytes_to_copy);
+				memcpy(stream_buffer.get() + stream_buffer_pos, temp_buffer.get(), bytes_to_copy);
 				stream_buffer_pos += bytes_to_copy;
 
 				// Stream when buffer is full
@@ -1157,7 +1472,7 @@ void record_and_stream_audio(void)
 				{
 					ESP_LOGI(AUDIO_TAG, "Streaming chunk %d bytes...", stream_buffer_pos);
 
-					esp_err_t stream_err = stream_audio_chunk(stream_buffer, stream_buffer_pos, is_first_chunk, false);
+					esp_err_t stream_err = stream_audio_chunk(stream_buffer.get(), stream_buffer_pos, is_first_chunk, false);
 					if (stream_err == ESP_OK)
 					{
 						total_streamed += stream_buffer_pos;
@@ -1176,7 +1491,7 @@ void record_and_stream_audio(void)
 					size_t remaining = bytes_read - bytes_to_copy;
 					if (remaining > 0)
 					{
-						memcpy(stream_buffer, (uint8_t *)temp_buffer + bytes_to_copy, remaining);
+						memcpy(stream_buffer.get(), (uint8_t *)temp_buffer.get() + bytes_to_copy, remaining);
 						stream_buffer_pos = remaining;
 					}
 				}
@@ -1190,7 +1505,7 @@ void record_and_stream_audio(void)
 					if (stream_buffer_pos > 0)
 					{
 						ESP_LOGI(AUDIO_TAG, "Sending final chunk: %d bytes", stream_buffer_pos);
-						stream_audio_chunk(stream_buffer, stream_buffer_pos, false, true);
+						stream_audio_chunk(stream_buffer.get(), stream_buffer_pos, false, true);
 						total_streamed += stream_buffer_pos;
 					}
 					else if (!is_first_chunk)
@@ -1209,7 +1524,7 @@ void record_and_stream_audio(void)
 					ESP_LOGI(AUDIO_TAG, "Maximum recording time reached. Ending streaming...");
 					if (stream_buffer_pos > 0)
 					{
-						stream_audio_chunk(stream_buffer, stream_buffer_pos, false, true);
+						stream_audio_chunk(stream_buffer.get(), stream_buffer_pos, false, true);
 					}
 					break;
 				}
@@ -1219,8 +1534,7 @@ void record_and_stream_audio(void)
 		vTaskDelay(pdMS_TO_TICKS(1)); // Minimal delay for streaming
 	}
 
-	free(temp_buffer);
-	free(stream_buffer);
+	// RAII: temp_buffer and stream_buffer automatically freed when going out of scope
 	i2s_driver_uninstall(I2S_NUM);
 }
 
@@ -1255,9 +1569,9 @@ void keyword_listening_loop(void)
 {
 	ESP_LOGI(AUDIO_TAG, "🎧 Starting keyword detection - Say 'Hey El'");
 
-	// Initialize keyword detector
-	keyword_detector_t *detector = init_keyword_detector();
-	if (!detector)
+	// Initialize keyword detector using C++ class with RAII
+	KeywordDetector detector;
+	if (!detector.isValid())
 	{
 		ESP_LOGE(AUDIO_TAG, "Failed to initialize keyword detector");
 		return;
@@ -1267,25 +1581,25 @@ void keyword_listening_loop(void)
 	if (init_microphone() != ESP_OK)
 	{
 		ESP_LOGE(AUDIO_TAG, "Failed to initialize microphone for keyword detection");
-		free(detector);
-		return;
+		return; // RAII will handle cleanup automatically
 	}
 
-	int16_t *temp_buffer = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
+	// Use RAII for temp buffer too
+	std::unique_ptr<int16_t[]> temp_buffer(new int16_t[BUFFER_SIZE]);
 	if (!temp_buffer)
 	{
 		ESP_LOGE(AUDIO_TAG, "Failed to allocate temp buffer for keyword detection");
 		i2s_driver_uninstall(I2S_NUM);
-		free(detector);
 		return;
 	}
 
 	ESP_LOGI(AUDIO_TAG, "👂 Listening for keyword 'Hey El'...");
+	show_voice_status("LISTENING", LCD_COLOR_CYAN);
 
 	while (1)
 	{
 		size_t bytes_read = 0;
-		esp_err_t ret = i2s_read(I2S_NUM, temp_buffer, BUFFER_SIZE * sizeof(int16_t), &bytes_read, portMAX_DELAY);
+		esp_err_t ret = i2s_read(I2S_NUM, temp_buffer.get(), BUFFER_SIZE * sizeof(int16_t), &bytes_read, portMAX_DELAY);
 
 		if (ret != ESP_OK)
 		{
@@ -1298,14 +1612,15 @@ void keyword_listening_loop(void)
 			size_t sample_count = bytes_read / sizeof(int16_t);
 
 			// Check for basic voice activity first to avoid unnecessary processing
-			bool has_voice = detect_voice_activity(temp_buffer, sample_count);
+			bool has_voice = detect_voice_activity(temp_buffer.get(), sample_count);
 
 			if (has_voice)
 			{
 				// Process samples for keyword detection only when voice is present
-				if (process_keyword_detection(detector, temp_buffer, sample_count))
+				if (detector.processDetection(temp_buffer.get(), sample_count))
 				{
 					ESP_LOGI(AUDIO_TAG, "🎯 KEYWORD DETECTED! Switching to command mode...");
+					show_voice_status("PROCESSING", LCD_COLOR_YELLOW);
 
 					// Play confirmation beep
 					i2s_driver_uninstall(I2S_NUM);
@@ -1315,7 +1630,7 @@ void keyword_listening_loop(void)
 					record_and_stream_audio();
 
 					// Reset keyword detector and continue listening
-					reset_keyword_detector(detector);
+					detector.reset();
 
 					// Reinitialize microphone for keyword detection
 					if (init_microphone() != ESP_OK)
@@ -1325,6 +1640,7 @@ void keyword_listening_loop(void)
 					}
 
 					ESP_LOGI(AUDIO_TAG, "🔄 Back to keyword listening mode");
+					show_voice_status("LISTENING", LCD_COLOR_CYAN);
 				}
 
 				// Shorter delay when voice is active
@@ -1343,11 +1659,7 @@ void keyword_listening_loop(void)
 		}
 	}
 
-	// Cleanup
-	free(temp_buffer);
-	if (detector->audio_buffer)
-		free(detector->audio_buffer);
-	free(detector);
+	// RAII handles cleanup automatically when function exits
 	i2s_driver_uninstall(I2S_NUM);
 }
 
@@ -1386,16 +1698,12 @@ void wifi_init_sta(void)
 														NULL,
 														&instance_got_ip));
 
-	wifi_config_t wifi_config = {
-		.sta = {
-			.ssid = WIFI_SSID,
-			.password = WIFI_PASS,
-			.threshold.authmode = WIFI_AUTH_WPA2_PSK,
-			.pmf_cfg = {
-				.capable = true,
-				.required = false},
-		},
-	};
+	wifi_config_t wifi_config = {};
+	strcpy((char*)wifi_config.sta.ssid, WIFI_SSID);
+	strcpy((char*)wifi_config.sta.password, WIFI_PASS);
+	wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+	wifi_config.sta.pmf_cfg.capable = true;
+	wifi_config.sta.pmf_cfg.required = false;
 	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 	ESP_ERROR_CHECK(esp_wifi_start());
