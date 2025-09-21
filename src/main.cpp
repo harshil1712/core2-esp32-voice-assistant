@@ -8,12 +8,12 @@
 #include <cstring>
 #include <memory>
 
-#define WIFI_SSID "WIFI_SSID_HERE"
-#define WIFI_PASS "WIFI_PASSWORD_HERE"
+#define WIFI_SSID "WIFI_SSID"
+#define WIFI_PASS "PASSWORD"
 #define WIFI_MAXIMUM_RETRY 5
 
 // WebSocket server configuration
-#define WS_HOST "DEPLOYED_WS_URL" // Replace with your server host
+#define WS_HOST "DNS_OR_IP_ADDRESS" // Replace with your server address
 // Alternative: #define WS_HOST "192.168.0.1" // Try router IP if direct connection fails
 #define WS_PORT 443   // Replace with your server port
 #define WS_PATH "/ws" // WebSocket endpoint
@@ -28,6 +28,7 @@ enum DeviceState
     STATE_READY,
     STATE_LISTENING,
     STATE_PROCESSING,
+    STATE_TRANSCRIBING,
     STATE_SPEAKING,
     STATE_ERROR
 };
@@ -43,13 +44,13 @@ const char *password = WIFI_PASS;
 #define SAMPLE_RATE 16000
 #define I2S_NUM (i2s_port_t)0
 #define BITS_PER_SAMPLE I2S_BITS_PER_SAMPLE_16BIT
-#define I2S_SCK 12
-#define I2S_WS 0
-#define I2S_SD 34
+#define I2S_SCK 12 // Bit clock (correct)
+#define I2S_WS 13  // Word select (corrected for M5Core2)
+#define I2S_SD 35  // Serial data (corrected for M5Core2)
 #define BUFFER_SIZE 1024
 
 // WebSocket and audio buffer configuration
-#define AUDIO_CHUNK_SIZE 4096
+#define AUDIO_CHUNK_SIZE 48000 // 3 seconds at 16kHz (was 4096 = 0.256s)
 
 // WebSocket client instance
 WebSocketsClient webSocket;
@@ -66,8 +67,10 @@ static const char *LCD_TAG = "lcd";
 
 // Function declarations
 void update_display(const char *message);
+void update_display_with_transcription(const char *status, const char *transcription);
 void handle_touch();
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length);
+void handle_transcription_message(const char *json_string);
 void init_websocket();
 void send_audio_chunk(uint8_t *data, size_t length);
 void start_recording();
@@ -75,11 +78,23 @@ void stop_recording();
 void init_audio();
 void set_state(DeviceState new_state);
 void play_audio_response(uint8_t *data, size_t length);
+void check_processing_timeout();
+void check_recording_timeout();
 
 // Global variables for recording state
 bool is_recording = false;
 std::unique_ptr<int16_t[]> audio_buffer;
 size_t audio_buffer_pos = 0;
+
+// Variables for transcription and timeout handling
+String last_transcription = "";
+String last_response = "";
+unsigned long processing_start_time = 0;
+const unsigned long PROCESSING_TIMEOUT = 30000; // 30 seconds timeout
+
+// Variables for recording timeout
+unsigned long recording_start_time = 0;
+const unsigned long RECORDING_TIMEOUT = 5000; // 5 seconds max recording
 
 // MVP Implementation - Core Functions
 
@@ -107,6 +122,9 @@ void set_state(DeviceState new_state)
         break;
     case STATE_PROCESSING:
         update_display("Processing...");
+        break;
+    case STATE_TRANSCRIBING:
+        update_display("Transcribing...");
         break;
     case STATE_SPEAKING:
         update_display("Speaking...");
@@ -137,6 +155,135 @@ void update_display(const char *message)
     M5.Display.print(message);
 }
 
+// Enhanced display function with transcription text
+void update_display_with_transcription(const char *status, const char *transcription)
+{
+    LOG_INFO(LCD_TAG, "Display: %s | Transcription: %s", status, transcription);
+
+    // Clear screen
+    M5.Display.fillScreen(TFT_BLACK);
+
+    // Display status at top
+    M5.Display.setTextColor(TFT_CYAN);
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(10, 10);
+    M5.Display.print(status);
+
+    // Display transcription in the middle (if available)
+    if (transcription && strlen(transcription) > 0)
+    {
+        M5.Display.setTextColor(TFT_WHITE);
+        M5.Display.setTextSize(1);
+        M5.Display.setCursor(10, 50);
+
+        // Word wrap for long transcriptions
+        String text = String(transcription);
+        int maxCharsPerLine = 35; // Approximate for text size 1
+        int lineHeight = 20;
+        int currentY = 50;
+
+        while (text.length() > 0 && currentY < M5.Display.height() - 20)
+        {
+            String line = text.substring(0, min((int)text.length(), maxCharsPerLine));
+
+            // Find last space to avoid breaking words
+            if (text.length() > maxCharsPerLine)
+            {
+                int lastSpace = line.lastIndexOf(' ');
+                if (lastSpace > 0)
+                {
+                    line = line.substring(0, lastSpace);
+                }
+            }
+
+            M5.Display.setCursor(10, currentY);
+            M5.Display.print(line);
+
+            text = text.substring(line.length());
+            text.trim(); // Remove leading spaces
+            currentY += lineHeight;
+        }
+    }
+
+    // Display instructions at bottom
+    M5.Display.setTextColor(TFT_YELLOW);
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(10, M5.Display.height() - 30);
+    M5.Display.print("Tap to speak");
+}
+
+// Handle JSON transcription messages from server
+void handle_transcription_message(const char *json_string)
+{
+    LOG_INFO(WS_TAG, "Parsing JSON: %s", json_string);
+
+    // Parse JSON using ArduinoJson
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, json_string);
+
+    if (error)
+    {
+        LOG_ERROR(WS_TAG, "JSON parsing failed: %s", error.c_str());
+        return;
+    }
+
+    // Check message type
+    const char *type = doc["type"];
+    if (type == nullptr)
+    {
+        LOG_ERROR(WS_TAG, "No message type found in JSON");
+        return;
+    }
+
+    if (strcmp(type, "transcription") == 0)
+    {
+        // Handle transcription message
+        const char *text = doc["text"];
+        const char *response = doc["response"];
+
+        if (text != nullptr)
+        {
+            last_transcription = String(text);
+            LOG_INFO(WS_TAG, "Transcription received: %s", text);
+        }
+
+        if (response != nullptr)
+        {
+            last_response = String(response);
+            LOG_INFO(WS_TAG, "Response text: %s", response);
+        }
+
+        // Update display with transcription
+        set_state(STATE_TRANSCRIBING);
+        update_display_with_transcription("Transcribed", last_transcription.c_str());
+    }
+    else if (strcmp(type, "error") == 0)
+    {
+        // Handle error message
+        const char *message = doc["message"];
+        if (message != nullptr)
+        {
+            LOG_ERROR(WS_TAG, "Server error: %s", message);
+            update_display_with_transcription("Error", message);
+            delay(3000); // Show error for 3 seconds
+            set_state(STATE_READY);
+        }
+    }
+    else if (strcmp(type, "connection") == 0)
+    {
+        // Handle connection confirmation
+        const char *message = doc["message"];
+        if (message != nullptr)
+        {
+            LOG_INFO(WS_TAG, "Connection message: %s", message);
+        }
+    }
+    else
+    {
+        LOG_INFO(WS_TAG, "Unknown message type: %s", type);
+    }
+}
+
 // Touch detection
 void handle_touch()
 {
@@ -144,25 +291,54 @@ void handle_touch()
 
     if (M5.Touch.getCount() > 0)
     {
-        LOG_INFO(TAG, "Touch detected");
-        delay(200); // Debounce touch
+        auto touchDetail = M5.Touch.getDetail();
+        LOG_INFO(TAG, "Touch detected at (%d, %d)", touchDetail.x, touchDetail.y);
+
+        // Visual feedback for touch
+        M5.Display.fillCircle(touchDetail.x, touchDetail.y, 10, TFT_RED);
+        delay(100); // Brief visual feedback
 
         if (current_state == STATE_READY)
         {
+            LOG_INFO(TAG, "Starting recording from touch");
             start_recording();
         }
         else if (current_state == STATE_LISTENING)
         {
+            LOG_INFO(TAG, "Stopping recording from touch");
             stop_recording();
         }
         else if (current_state == STATE_ERROR)
         {
+            LOG_INFO(TAG, "Retrying connection from touch");
             // Retry connection
             if (!websocket_connected)
             {
                 init_websocket();
             }
+            else
+            {
+                set_state(STATE_READY);
+            }
         }
+        else if (current_state == STATE_TRANSCRIBING)
+        {
+            LOG_INFO(TAG, "Currently transcribing, ignoring touch");
+            update_display_with_transcription("Transcribing...", "Please wait");
+        }
+        else if (current_state == STATE_PROCESSING)
+        {
+            LOG_INFO(TAG, "Currently processing, ignoring touch");
+            update_display("Processing... Please wait");
+        }
+
+        // Wait for touch release to avoid multiple triggers
+        while (M5.Touch.getCount() > 0)
+        {
+            M5.update();
+            delay(50);
+        }
+        delay(100); // Additional debounce
     }
 }
 
@@ -188,13 +364,15 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
         break;
     case WStype_TEXT:
         LOG_INFO(WS_TAG, "Received text: %s", payload);
+        // Handle JSON messages (transcription, errors, etc.)
+        handle_transcription_message((const char *)payload);
         break;
     case WStype_BIN:
         LOG_INFO(WS_TAG, "Received binary data: %u bytes", length);
         // This is audio response from server
         set_state(STATE_SPEAKING);
         play_audio_response(payload, length);
-        set_state(STATE_READY);
+        // Note: play_audio_response handles state transition back to READY
         break;
     default:
         break;
@@ -231,6 +409,26 @@ void init_audio()
 {
     LOG_INFO(AUDIO_TAG, "Initializing audio system...");
 
+    // Try to use M5Unified microphone first
+    auto mic_cfg = M5.Mic.config();
+    mic_cfg.sample_rate = SAMPLE_RATE;
+    mic_cfg.over_sampling = 1;
+    mic_cfg.magnification = 16;
+    mic_cfg.use_adc = false;
+
+    M5.Mic.config(mic_cfg);
+    LOG_INFO(AUDIO_TAG, "M5Unified microphone configured");
+
+    if (M5.Mic.begin())
+    {
+        LOG_INFO(AUDIO_TAG, "M5 Microphone started successfully");
+    }
+    else
+    {
+        LOG_ERROR(AUDIO_TAG, "Failed to start M5 microphone");
+    }
+
+    // Fallback to manual I2S configuration
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = SAMPLE_RATE,
@@ -254,14 +452,18 @@ void init_audio()
     if (err != ESP_OK)
     {
         LOG_ERROR(AUDIO_TAG, "Failed to install I2S driver: %d", err);
-        return;
     }
-
-    err = i2s_set_pin(I2S_NUM, &pin_config);
-    if (err != ESP_OK)
+    else
     {
-        LOG_ERROR(AUDIO_TAG, "Failed to set I2S pins: %d", err);
-        return;
+        err = i2s_set_pin(I2S_NUM, &pin_config);
+        if (err != ESP_OK)
+        {
+            LOG_ERROR(AUDIO_TAG, "Failed to set I2S pins: %d", err);
+        }
+        else
+        {
+            LOG_INFO(AUDIO_TAG, "I2S driver configured successfully");
+        }
     }
 
     // Allocate audio buffer
@@ -280,6 +482,13 @@ void start_recording()
     set_state(STATE_LISTENING);
     is_recording = true;
     audio_buffer_pos = 0;
+    recording_start_time = millis(); // Start recording timeout timer
+
+    // Visual feedback for recording start
+    update_display_with_transcription("RECORDING", "Speak now... Tap again to stop");
+
+    // Add a red recording indicator
+    M5.Display.fillCircle(M5.Display.width() - 20, 20, 8, TFT_RED);
 }
 
 // Stop recording and send audio
@@ -291,11 +500,19 @@ void stop_recording()
     LOG_INFO(AUDIO_TAG, "Stopping recording...");
     set_state(STATE_PROCESSING);
     is_recording = false;
+    processing_start_time = millis(); // Start timeout timer
 
     if (audio_buffer_pos > 0)
     {
         // Send recorded audio to server
         send_audio_chunk((uint8_t *)audio_buffer.get(), audio_buffer_pos * sizeof(int16_t));
+        LOG_INFO(AUDIO_TAG, "Sent %d samples (%d bytes) to server",
+                 audio_buffer_pos, audio_buffer_pos * sizeof(int16_t));
+    }
+    else
+    {
+        LOG_ERROR(AUDIO_TAG, "No audio data to send");
+        set_state(STATE_READY);
     }
 
     audio_buffer_pos = 0;
@@ -306,17 +523,96 @@ void play_audio_response(uint8_t *data, size_t length)
 {
     LOG_INFO(AUDIO_TAG, "Playing audio response: %d bytes", length);
 
-    // Use M5.Speaker to play the audio
-    M5.Speaker.setVolume(128);
-    M5.Speaker.playRaw(data, length, SAMPLE_RATE, false);
-
-    // Wait for playback to complete
-    while (M5.Speaker.isPlaying())
+    // Check if this looks like an error beep (short audio)
+    if (length < 1000)
     {
-        delay(10);
+        LOG_INFO(AUDIO_TAG, "Short audio detected - likely error beep");
+        update_display_with_transcription("Error", "Server error occurred");
+    }
+    else
+    {
+        update_display_with_transcription("Speaking", last_response.c_str());
+    }
+
+    // Set volume and play audio
+    M5.Speaker.setVolume(180); // Increase volume for better audibility
+
+    // Check if audio data looks valid (simple validation)
+    bool validAudio = false;
+    if (length >= 2)
+    {
+        // Check for reasonable audio data (not all zeros)
+        for (size_t i = 0; i < min(length, (size_t)100); i += 2)
+        {
+            int16_t sample = (int16_t)((data[i + 1] << 8) | data[i]);
+            if (abs(sample) > 100) // Some reasonable threshold
+            {
+                validAudio = true;
+                break;
+            }
+        }
+    }
+
+    if (validAudio)
+    {
+        // Try to play as raw PCM audio at 16kHz
+        M5.Speaker.playRaw(data, length, SAMPLE_RATE, false);
+
+        // Wait for playback to complete
+        while (M5.Speaker.isPlaying())
+        {
+            delay(10);
+            // Allow other tasks to run during playback
+            webSocket.loop();
+        }
+    }
+    else
+    {
+        LOG_ERROR(AUDIO_TAG, "Invalid audio data received");
+        // Play a simple beep as fallback
+        M5.Speaker.tone(800, 500); // 800Hz for 500ms
+        delay(500);
     }
 
     LOG_INFO(AUDIO_TAG, "Audio playback completed");
+
+    // Return to ready state after playing audio
+    delay(500); // Small delay before showing ready state
+    set_state(STATE_READY);
+
+    // Show the transcription result for a few seconds
+    if (last_transcription.length() > 0)
+    {
+        update_display_with_transcription("Ready", last_transcription.c_str());
+    }
+}
+
+// Check for processing timeout
+void check_processing_timeout()
+{
+    if (current_state == STATE_PROCESSING || current_state == STATE_TRANSCRIBING)
+    {
+        if (millis() - processing_start_time > PROCESSING_TIMEOUT)
+        {
+            LOG_ERROR(TAG, "Processing timeout reached");
+            update_display_with_transcription("Timeout", "No response from server");
+            delay(3000);
+            set_state(STATE_READY);
+        }
+    }
+}
+
+// Check for recording timeout
+void check_recording_timeout()
+{
+    if (is_recording)
+    {
+        if (millis() - recording_start_time > RECORDING_TIMEOUT)
+        {
+            LOG_INFO(AUDIO_TAG, "Recording timeout reached (5 seconds)");
+            stop_recording();
+        }
+    }
 }
 
 void setup()
@@ -386,31 +682,61 @@ void loop()
     // Handle touch input
     handle_touch();
 
+    // Check for processing timeouts
+    check_processing_timeout();
+
+    // Check for recording timeouts
+    check_recording_timeout();
+
     // Read audio data when recording
     if (is_recording)
     {
         int16_t temp_buffer[BUFFER_SIZE];
-        size_t bytes_read = 0;
+        size_t samples_read = 0;
 
+        // Use I2S to read audio data directly
+        size_t bytes_read = 0;
         esp_err_t ret = i2s_read(I2S_NUM, temp_buffer, BUFFER_SIZE * sizeof(int16_t),
                                  &bytes_read, 10 / portTICK_PERIOD_MS);
 
         if (ret == ESP_OK && bytes_read > 0)
         {
-            size_t samples_read = bytes_read / sizeof(int16_t);
+            samples_read = bytes_read / sizeof(int16_t);
+
+            // Debug: Print first few samples to check for actual audio data
+            if (samples_read > 4 && audio_buffer_pos < 100) // Only log first few chunks
+            {
+                Serial.printf("Audio samples: %d, %d, %d, %d (total: %d)\n",
+                              temp_buffer[0], temp_buffer[1], temp_buffer[2], temp_buffer[3], samples_read);
+            }
 
             // Copy samples to our buffer if there's space
             for (size_t i = 0; i < samples_read && audio_buffer_pos < AUDIO_CHUNK_SIZE; i++)
             {
                 audio_buffer[audio_buffer_pos++] = temp_buffer[i];
             }
+        }
+        else if (ret != ESP_OK)
+        {
+            Serial.printf("I2S read failed: ret=%d, bytes_read=%d\n", ret, bytes_read);
+        }
 
-            // Auto-stop if buffer is full
-            if (audio_buffer_pos >= AUDIO_CHUNK_SIZE)
-            {
-                LOG_INFO(AUDIO_TAG, "Buffer full, stopping recording");
-                stop_recording();
-            }
+        // Visual feedback - pulse recording indicator
+        static unsigned long lastPulse = 0;
+        static bool pulseState = false;
+        if (millis() - lastPulse > 500) // Pulse every 500ms
+        {
+            pulseState = !pulseState;
+            uint16_t color = pulseState ? TFT_RED : TFT_MAROON; // Use TFT_MAROON instead of TFT_DARKRED
+            M5.Display.fillCircle(M5.Display.width() - 20, 20, 8, color);
+            lastPulse = millis();
+        }
+
+        // Safety check - stop if buffer is nearly full (keep some margin)
+        if (audio_buffer_pos >= AUDIO_CHUNK_SIZE - 1000)
+        {
+            LOG_INFO(AUDIO_TAG, "Buffer nearly full, stopping recording for safety");
+            stop_recording();
         }
     }
 
