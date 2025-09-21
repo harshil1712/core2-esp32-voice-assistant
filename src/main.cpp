@@ -96,6 +96,14 @@ const unsigned long PROCESSING_TIMEOUT = 30000; // 30 seconds timeout
 unsigned long recording_start_time = 0;
 const unsigned long RECORDING_TIMEOUT = 5000; // 5 seconds max recording
 
+// Variables for chunked audio reception
+bool receiving_chunked_audio = false;
+std::unique_ptr<uint8_t[]> chunked_audio_buffer;
+size_t expected_audio_size = 0;
+size_t received_audio_size = 0;
+int expected_chunks = 0;
+int received_chunks = 0;
+
 // MVP Implementation - Core Functions
 
 // State management
@@ -269,6 +277,59 @@ void handle_transcription_message(const char *json_string)
             set_state(STATE_READY);
         }
     }
+    else if (strcmp(type, "audio_start") == 0)
+    {
+        // Handle chunked audio start
+        expected_audio_size = doc["totalSize"];
+        expected_chunks = doc["chunks"];
+        int chunk_size = doc["chunkSize"];
+
+        LOG_INFO(WS_TAG, "Starting chunked audio reception: %u bytes, %d chunks, %d bytes/chunk",
+                 expected_audio_size, expected_chunks, chunk_size);
+
+        // Allocate buffer for full audio
+        chunked_audio_buffer.reset(new uint8_t[expected_audio_size]);
+        received_audio_size = 0;
+        received_chunks = 0;
+        receiving_chunked_audio = true;
+
+        update_display_with_transcription("Receiving Audio", "Downloading chunks...");
+    }
+    else if (strcmp(type, "audio_complete") == 0)
+    {
+        // Handle chunked audio completion
+        LOG_INFO(WS_TAG, "Chunked audio reception complete: %u bytes, %d chunks",
+                 received_audio_size, received_chunks);
+
+        if (receiving_chunked_audio && received_audio_size == expected_audio_size)
+        {
+            // Debug: Check first few bytes of reassembled audio
+            LOG_INFO(WS_TAG, "First 8 bytes of reassembled audio: %02x %02x %02x %02x %02x %02x %02x %02x",
+                     chunked_audio_buffer[0], chunked_audio_buffer[1], chunked_audio_buffer[2], chunked_audio_buffer[3],
+                     chunked_audio_buffer[4], chunked_audio_buffer[5], chunked_audio_buffer[6], chunked_audio_buffer[7]);
+
+            // Comprehensive debugging
+            LOG_INFO(WS_TAG, "CHUNK DEBUG: Expected %u bytes, received %u bytes, chunks %d/%d",
+                     expected_audio_size, received_audio_size, received_chunks, expected_chunks);
+
+            // Play the reassembled audio
+            LOG_INFO(WS_TAG, "Playing reassembled audio: %u bytes", received_audio_size);
+            set_state(STATE_SPEAKING);
+            play_audio_response(chunked_audio_buffer.get(), received_audio_size);
+        }
+        else
+        {
+            LOG_ERROR(WS_TAG, "Audio chunk mismatch: received %u bytes, expected %u bytes",
+                      received_audio_size, expected_audio_size);
+            update_display_with_transcription("Audio Error", "Incomplete audio received");
+            delay(2000);
+            set_state(STATE_READY);
+        }
+
+        // Reset chunked audio state
+        receiving_chunked_audio = false;
+        chunked_audio_buffer.reset();
+    }
     else if (strcmp(type, "connection") == 0)
     {
         // Handle connection confirmation
@@ -348,12 +409,12 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     switch (type)
     {
     case WStype_DISCONNECTED:
-        LOG_INFO(WS_TAG, "WebSocket Disconnected");
+        LOG_ERROR(WS_TAG, "WebSocket Disconnected - length: %u, heap free: %u bytes", length, ESP.getFreeHeap());
         websocket_connected = false;
         set_state(STATE_ERROR);
         break;
     case WStype_ERROR:
-        LOG_ERROR(WS_TAG, "WebSocket Error: %s", payload);
+        LOG_ERROR(WS_TAG, "WebSocket Error (length: %u): %s, heap free: %u bytes", length, payload, ESP.getFreeHeap());
         websocket_connected = false;
         set_state(STATE_ERROR);
         break;
@@ -368,11 +429,41 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
         handle_transcription_message((const char *)payload);
         break;
     case WStype_BIN:
-        LOG_INFO(WS_TAG, "Received binary data: %u bytes", length);
-        // This is audio response from server
-        set_state(STATE_SPEAKING);
-        play_audio_response(payload, length);
-        // Note: play_audio_response handles state transition back to READY
+        LOG_INFO(WS_TAG, "Received binary data: %u bytes, heap before: %u bytes", length, ESP.getFreeHeap());
+
+        if (receiving_chunked_audio)
+        {
+            // This is a chunk of the audio stream
+            if (received_audio_size + length <= expected_audio_size)
+            {
+                memcpy(chunked_audio_buffer.get() + received_audio_size, payload, length);
+                received_audio_size += length;
+                received_chunks++;
+
+                LOG_INFO(WS_TAG, "Received chunk %d/%d: %u bytes (total: %u/%u bytes)",
+                         received_chunks, expected_chunks, length, received_audio_size, expected_audio_size);
+
+                // Update progress display
+                int progress = (received_audio_size * 100) / expected_audio_size;
+                char progress_text[50];
+                snprintf(progress_text, sizeof(progress_text), "Progress: %d%% (%d/%d chunks)",
+                         progress, received_chunks, expected_chunks);
+                update_display_with_transcription("Receiving Audio", progress_text);
+            }
+            else
+            {
+                LOG_ERROR(WS_TAG, "Audio chunk overflow: would exceed expected size");
+            }
+        }
+        else
+        {
+            // Legacy: single large audio message (fallback)
+            LOG_INFO(WS_TAG, "Received complete audio: %u bytes", length);
+            set_state(STATE_SPEAKING);
+            play_audio_response(payload, length);
+        }
+
+        LOG_INFO(WS_TAG, "Binary data processed, heap after: %u bytes", ESP.getFreeHeap());
         break;
     default:
         break;
@@ -537,26 +628,82 @@ void play_audio_response(uint8_t *data, size_t length)
     // Set volume and play audio
     M5.Speaker.setVolume(180); // Increase volume for better audibility
 
-    // Check if audio data looks valid (simple validation)
+    // Check if audio data looks valid (back to working validation)
     bool validAudio = false;
+    int16_t maxSample = 0;
+    int nonZeroSamples = 0;
+
     if (length >= 2)
     {
-        // Check for reasonable audio data (not all zeros)
-        for (size_t i = 0; i < min(length, (size_t)100); i += 2)
+        // First, find where actual audio starts (skip initial zeros/headers)
+        size_t audioStartByte = 0;
+        for (size_t byte = 0; byte < min(length, (size_t)200); byte += 2)
         {
-            int16_t sample = (int16_t)((data[i + 1] << 8) | data[i]);
-            if (abs(sample) > 100) // Some reasonable threshold
+            int16_t sample = (int16_t)(data[byte] | (data[byte + 1] << 8));
+            if (abs(sample) > 20) // Found meaningful audio data
             {
-                validAudio = true;
+                audioStartByte = byte;
+                LOG_INFO(AUDIO_TAG, "Audio data starts at byte %d", audioStartByte);
                 break;
             }
         }
+
+        // Analyze samples starting from where audio actually begins
+        size_t startSample = audioStartByte / 2;
+        size_t totalSamples = length / 2;
+        size_t samplesToCheck = min(totalSamples - startSample, (size_t)100);
+
+        LOG_INFO(AUDIO_TAG, "Checking %d samples starting from sample %d", samplesToCheck, startSample);
+
+        for (size_t i = 0; i < samplesToCheck; i++)
+        {
+            size_t sampleIndex = startSample + i;
+            size_t byteIndex = sampleIndex * 2;
+
+            if (byteIndex + 1 < length)
+            {
+                // ESP32 uses little-endian format
+                int16_t sample = (int16_t)(data[byteIndex] | (data[byteIndex + 1] << 8));
+                int16_t absSample = abs(sample);
+
+                if (absSample > 50) // Lower threshold for compressed audio
+                {
+                    nonZeroSamples++;
+                    if (absSample > maxSample)
+                        maxSample = absSample;
+                }
+            }
+        }
+
+        // Valid if we have some non-zero samples (>5% of checked samples)
+        if (samplesToCheck > 0)
+        {
+            validAudio = nonZeroSamples > (samplesToCheck / 20);
+        }
+
+        LOG_INFO(AUDIO_TAG, "Audio validation: %d/%d non-zero samples, max: %d, valid: %s",
+                 nonZeroSamples, samplesToCheck, maxSample, validAudio ? "YES" : "NO");
     }
 
     if (validAudio)
     {
-        // Try to play as raw PCM audio at 16kHz
-        M5.Speaker.playRaw(data, length, SAMPLE_RATE, false);
+        // Play audio starting from where actual data begins (skip headers)
+        size_t audioStartByte = 0;
+        for (size_t byte = 0; byte < min(length, (size_t)200); byte += 2)
+        {
+            int16_t sample = (int16_t)(data[byte] | (data[byte + 1] << 8));
+            if (abs(sample) > 20)
+            {
+                audioStartByte = byte;
+                break;
+            }
+        }
+
+        size_t audioDataLength = length - audioStartByte;
+        LOG_INFO(AUDIO_TAG, "Playing audio from byte %d, length %d", audioStartByte, audioDataLength);
+
+        // Try to play as raw PCM audio at 16kHz (back to working state)
+        M5.Speaker.playRaw(data + audioStartByte, audioDataLength, SAMPLE_RATE, false);
 
         // Wait for playback to complete
         while (M5.Speaker.isPlaying())
@@ -621,16 +768,18 @@ void setup()
     delay(1000);
 
     LOG_INFO(TAG, "=== M5Stack Core2 Voice Assistant MVP ===");
+    LOG_INFO(TAG, "Initial heap: %u bytes", ESP.getFreeHeap());
 
     // Initialize state
     set_state(STATE_BOOT);
 
     // Initialize M5Stack
     M5.begin();
-    LOG_INFO(TAG, "M5Stack initialized");
+    LOG_INFO(TAG, "M5Stack initialized, heap: %u bytes", ESP.getFreeHeap());
 
     // Initialize audio
     init_audio();
+    LOG_INFO(TAG, "Audio initialized, heap: %u bytes", ESP.getFreeHeap());
 
     // Connect to WiFi
     set_state(STATE_CONNECTING_WIFI);
