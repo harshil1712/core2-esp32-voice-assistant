@@ -3,10 +3,10 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <M5Unified.h>
-#include <driver/i2s.h>
 #include <esp_heap_caps.h>
 #include <cstring>
 #include <memory>
+#include <cmath>
 
 #define WIFI_SSID "WIFI_SSID"
 #define WIFI_PASS "PASSWORD"
@@ -42,12 +42,8 @@ const char *password = WIFI_PASS;
 
 // Audio configuration for MVP
 #define SAMPLE_RATE 16000
-#define I2S_NUM (i2s_port_t)0
-#define BITS_PER_SAMPLE I2S_BITS_PER_SAMPLE_16BIT
-#define I2S_SCK 12 // Bit clock (correct)
-#define I2S_WS 13  // Word select (corrected for M5Core2)
-#define I2S_SD 35  // Serial data (corrected for M5Core2)
 #define BUFFER_SIZE 1024
+// Note: I2S configuration handled by M5Unified microphone API
 
 // WebSocket and audio buffer configuration
 #define AUDIO_CHUNK_SIZE 48000 // 3 seconds at 16kHz (was 4096 = 0.256s)
@@ -80,6 +76,7 @@ void set_state(DeviceState new_state);
 void play_audio_response(uint8_t *data, size_t length);
 void check_processing_timeout();
 void check_recording_timeout();
+// void test_speaker_hardware();
 
 // Global variables for recording state
 bool is_recording = false;
@@ -387,6 +384,11 @@ void handle_touch()
             LOG_INFO(TAG, "Currently transcribing, ignoring touch");
             update_display_with_transcription("Transcribing...", "Please wait");
         }
+        else if (current_state == STATE_SPEAKING)
+        {
+            LOG_INFO(TAG, "Currently playing audio, ignoring touch");
+            update_display_with_transcription("Playing Audio", "Please wait for completion");
+        }
         else if (current_state == STATE_PROCESSING)
         {
             LOG_INFO(TAG, "Currently processing, ignoring touch");
@@ -519,44 +521,6 @@ void init_audio()
         LOG_ERROR(AUDIO_TAG, "Failed to start M5 microphone");
     }
 
-    // Fallback to manual I2S configuration
-    i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = BITS_PER_SAMPLE,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 4,
-        .dma_buf_len = BUFFER_SIZE,
-        .use_apll = false,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0};
-
-    i2s_pin_config_t pin_config = {
-        .bck_io_num = I2S_SCK,
-        .ws_io_num = I2S_WS,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = I2S_SD};
-
-    esp_err_t err = i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
-    if (err != ESP_OK)
-    {
-        LOG_ERROR(AUDIO_TAG, "Failed to install I2S driver: %d", err);
-    }
-    else
-    {
-        err = i2s_set_pin(I2S_NUM, &pin_config);
-        if (err != ESP_OK)
-        {
-            LOG_ERROR(AUDIO_TAG, "Failed to set I2S pins: %d", err);
-        }
-        else
-        {
-            LOG_INFO(AUDIO_TAG, "I2S driver configured successfully");
-        }
-    }
-
     // Allocate audio buffer
     audio_buffer.reset(new int16_t[AUDIO_CHUNK_SIZE]);
 
@@ -612,9 +576,33 @@ void stop_recording()
 // Play audio response
 void play_audio_response(uint8_t *data, size_t length)
 {
-    LOG_INFO(AUDIO_TAG, "Playing audio response: %d bytes", length);
+    LOG_INFO(AUDIO_TAG, "Playing audio response: %u bytes", (unsigned)length);
 
-    // Check if this looks like an error beep (short audio)
+    // DEBUGGING: Dump first 100 bytes as hex to see exact data
+    LOG_INFO(AUDIO_TAG, "Raw audio data dump:");
+    for (int i = 0; i < min(100, (int)length); i += 16)
+    {
+        char hex_line[120];
+        sprintf(hex_line, "%04x: ", i);
+        for (int j = 0; j < 16 && (i + j) < length; j++)
+        {
+            sprintf(hex_line + strlen(hex_line), "%02x ", data[i + j]);
+        }
+        Serial.println(hex_line);
+    }
+
+    // Enhanced audio debugging - log first 16 bytes to analyze format
+    if (length >= 16)
+    {
+        LOG_INFO(AUDIO_TAG, "Audio format analysis - First 16 bytes (should be immediate audio data):");
+        for (int i = 0; i < 16; i += 2)
+        {
+            int16_t sample = (int16_t)(data[i] | (data[i + 1] << 8));
+            Serial.printf("  [%d-%d]: 0x%02x%02x -> %d\n", i, i + 1, data[i], data[i + 1], sample);
+        }
+    }
+
+    // Short-audio check (keep existing behavior)
     if (length < 1000)
     {
         LOG_INFO(AUDIO_TAG, "Short audio detected - likely error beep");
@@ -625,92 +613,127 @@ void play_audio_response(uint8_t *data, size_t length)
         update_display_with_transcription("Speaking", last_response.c_str());
     }
 
-    // Set volume and play audio
-    M5.Speaker.setVolume(180); // Increase volume for better audibility
+    // Set volume and configure speaker for better quality
+    M5.Speaker.setVolume(120);           // Balanced volume for clarity
+    M5.Speaker.setChannelVolume(0, 120); // Ensure consistent channel volume
 
-    // Check if audio data looks valid (back to working validation)
+    // ---------------------------
+    // New validation: peak + RMS
+    // ---------------------------
     bool validAudio = false;
-    int16_t maxSample = 0;
-    int nonZeroSamples = 0;
 
     if (length >= 2)
     {
-        // First, find where actual audio starts (skip initial zeros/headers)
-        size_t audioStartByte = 0;
-        for (size_t byte = 0; byte < min(length, (size_t)200); byte += 2)
-        {
-            int16_t sample = (int16_t)(data[byte] | (data[byte + 1] << 8));
-            if (abs(sample) > 20) // Found meaningful audio data
-            {
-                audioStartByte = byte;
-                LOG_INFO(AUDIO_TAG, "Audio data starts at byte %d", audioStartByte);
-                break;
-            }
-        }
-
-        // Analyze samples starting from where audio actually begins
-        size_t startSample = audioStartByte / 2;
         size_t totalSamples = length / 2;
-        size_t samplesToCheck = min(totalSamples - startSample, (size_t)100);
+        size_t samplesToCheck = min(totalSamples, (size_t)1024);
 
-        LOG_INFO(AUDIO_TAG, "Checking %d samples starting from sample %d", samplesToCheck, startSample);
+        LOG_INFO(AUDIO_TAG, "Validating %u samples for peak/RMS", (unsigned)samplesToCheck);
 
-        for (size_t i = 0; i < samplesToCheck; i++)
+        if (samplesToCheck == 0)
         {
-            size_t sampleIndex = startSample + i;
-            size_t byteIndex = sampleIndex * 2;
+            LOG_ERROR(AUDIO_TAG, "No samples available to validate");
+            validAudio = false;
+        }
+        else
+        {
+            uint64_t sumSquares = 0;
+            int16_t peakSample = 0;
 
-            if (byteIndex + 1 < length)
+            for (size_t i = 0; i < samplesToCheck; ++i)
             {
-                // ESP32 uses little-endian format
+                size_t byteIndex = i * 2;
                 int16_t sample = (int16_t)(data[byteIndex] | (data[byteIndex + 1] << 8));
-                int16_t absSample = abs(sample);
+                int16_t absS = (sample < 0) ? -sample : sample;
+                sumSquares += (uint64_t)absS * (uint64_t)absS;
+                if (absS > peakSample)
+                    peakSample = absS;
+            }
 
-                if (absSample > 50) // Lower threshold for compressed audio
-                {
-                    nonZeroSamples++;
-                    if (absSample > maxSample)
-                        maxSample = absSample;
-                }
+            double rms = sqrt((double)sumSquares / (double)samplesToCheck);
+
+            LOG_INFO(AUDIO_TAG, "Validation metrics: peak=%d, rms=%.1f", peakSample, rms);
+
+            // Tunable thresholds (adjust after testing)
+            const int PEAK_THRESHOLD = 300;    // brief transient threshold
+            const double RMS_THRESHOLD = 40.0; // sustained energy threshold
+
+            // Accept if either measure indicates audio energy
+            validAudio = (peakSample >= PEAK_THRESHOLD) || (rms >= RMS_THRESHOLD);
+
+            // Fallback: accept very-low-energy signals to avoid false negatives
+            if (!validAudio && peakSample > 0 && rms > 1.0)
+            {
+                LOG_INFO(AUDIO_TAG, "Low-energy audio detected; accepting as fallback (peak=%d, rms=%.1f)", peakSample, rms);
+                validAudio = true;
             }
         }
-
-        // Valid if we have some non-zero samples (>5% of checked samples)
-        if (samplesToCheck > 0)
-        {
-            validAudio = nonZeroSamples > (samplesToCheck / 20);
-        }
-
-        LOG_INFO(AUDIO_TAG, "Audio validation: %d/%d non-zero samples, max: %d, valid: %s",
-                 nonZeroSamples, samplesToCheck, maxSample, validAudio ? "YES" : "NO");
+    }
+    else
+    {
+        validAudio = false;
     }
 
+    LOG_INFO(AUDIO_TAG, "Audio validation result: %s", validAudio ? "ACCEPTED" : "REJECTED");
+
+    // ---------------------------
+    // Play or fallback
+    // ---------------------------
     if (validAudio)
     {
-        // Play audio starting from where actual data begins (skip headers)
-        size_t audioStartByte = 0;
-        for (size_t byte = 0; byte < min(length, (size_t)200); byte += 2)
+        // AUTOMATIC HARDWARE TEST: Play clean tone first for comparison
+        // LOG_INFO(AUDIO_TAG, "STEP 1: Playing clean hardware test tone for comparison");
+        // update_display_with_transcription("Testing Hardware", "Clean 800Hz tone...");
+
+        // test_speaker_hardware();
+
+        // delay(500); // Brief pause between test and actual audio
+
+        // NOW PLAY SERVER AUDIO
+        LOG_INFO(AUDIO_TAG, "STEP 2: Playing server audio: %u bytes", (unsigned)length);
+        update_display_with_transcription("Playing Server Audio", "Listen for noise/distortion...");
+
+        // Fallback: use 24kHz playback rate. If you have a global audioFileSampleRate,
+        // replace the hardcoded 24000 below with that variable (ensure it's declared above).
+        uint32_t playback_rate = 24000;
+
+        LOG_INFO(AUDIO_TAG, "Playing audio at %u Hz", playback_rate);
+
+        // Configure speaker for optimal playback before playing
+        M5.Speaker.stop();                   // Ensure clean start
+        M5.Speaker.setAllChannelVolume(120); // Set all channels consistently
+
+        // STREAMING PLAYBACK: Use triple-buffering like SD card code for smooth playback
+        static constexpr const size_t buf_num = 3;
+        static constexpr const size_t buf_size = 1024;
+        static uint8_t play_buffers[buf_num][buf_size];
+
+        LOG_INFO(AUDIO_TAG, "Streaming audio with triple-buffering");
+
+        size_t data_remaining = length;
+        size_t data_pos = 0;
+        size_t buf_idx = 0;
+
+        // Stream audio using rotating buffers - no waiting between chunks
+        while (data_remaining > 0)
         {
-            int16_t sample = (int16_t)(data[byte] | (data[byte + 1] << 8));
-            if (abs(sample) > 20)
-            {
-                audioStartByte = byte;
-                break;
-            }
+            size_t chunk_len = (data_remaining < buf_size) ? data_remaining : buf_size;
+
+            // Copy chunk to buffer
+            memcpy(play_buffers[buf_idx], data + data_pos, chunk_len);
+
+            // Queue chunk for playback (non-blocking with wait=0)
+            // For 16-bit audio: cast to int16_t* and pass sample count (bytes >> 1)
+            M5.Speaker.playRaw((const int16_t *)play_buffers[buf_idx], chunk_len >> 1, playback_rate, false, 1, 0);
+
+            data_remaining -= chunk_len;
+            data_pos += chunk_len;
+            buf_idx = (buf_idx < (buf_num - 1)) ? buf_idx + 1 : 0;
         }
 
-        size_t audioDataLength = length - audioStartByte;
-        LOG_INFO(AUDIO_TAG, "Playing audio from byte %d, length %d", audioStartByte, audioDataLength);
-
-        // Try to play as raw PCM audio at 16kHz (back to working state)
-        M5.Speaker.playRaw(data + audioStartByte, audioDataLength, SAMPLE_RATE, false);
-
-        // Wait for playback to complete
+        // Wait for final playback to complete
         while (M5.Speaker.isPlaying())
         {
-            delay(10);
-            // Allow other tasks to run during playback
-            webSocket.loop();
+            delay(50);
         }
     }
     else
@@ -823,10 +846,49 @@ void setup()
     }
 }
 
+// Test speaker hardware with pure tone
+// void test_speaker_hardware()
+// {
+//     LOG_INFO(AUDIO_TAG, "Testing speaker hardware with 800Hz tone");
+
+//     const int sample_rate = 24000;
+//     const int duration_ms = 200; // 1 second
+//     const int frequency = 100;   // 800Hz tone
+//     const int samples = sample_rate * duration_ms / 1000;
+
+//     // Generate pure sine wave
+//     int16_t *tone_buffer = new int16_t[samples];
+//     for (int i = 0; i < samples; i++)
+//     {
+//         float t = (float)i / sample_rate;
+//         float amplitude = 0.3; // 30% volume to avoid clipping
+//         tone_buffer[i] = (int16_t)(amplitude * 32767 * sin(2 * M_PI * frequency * t));
+//     }
+
+//     LOG_INFO(AUDIO_TAG, "Generated %d samples for tone test", samples);
+
+//     // Configure and play tone
+//     M5.Speaker.stop();
+//     M5.Speaker.setVolume(120);
+//     M5.Speaker.playRaw((uint8_t *)tone_buffer, samples * sizeof(int16_t), sample_rate, false, 1, 0);
+
+//     // Wait for completion
+//     while (M5.Speaker.isPlaying())
+//     {
+//         delay(50);
+//     }
+
+//     delete[] tone_buffer;
+//     LOG_INFO(AUDIO_TAG, "Hardware tone test completed");
+// }
+
 void loop()
 {
-    // Handle WebSocket events
-    webSocket.loop();
+    // Handle WebSocket events (skip during critical audio playback)
+    if (current_state != STATE_SPEAKING)
+    {
+        webSocket.loop();
+    }
 
     // Handle touch input
     handle_touch();
@@ -840,34 +902,27 @@ void loop()
     // Read audio data when recording
     if (is_recording)
     {
-        int16_t temp_buffer[BUFFER_SIZE];
-        size_t samples_read = 0;
-
-        // Use I2S to read audio data directly
-        size_t bytes_read = 0;
-        esp_err_t ret = i2s_read(I2S_NUM, temp_buffer, BUFFER_SIZE * sizeof(int16_t),
-                                 &bytes_read, 10 / portTICK_PERIOD_MS);
-
-        if (ret == ESP_OK && bytes_read > 0)
+        // Use M5Unified microphone API (NOT direct i2s_read)
+        if (M5.Mic.isEnabled())
         {
-            samples_read = bytes_read / sizeof(int16_t);
+            // Record directly into our buffer
+            size_t samples_to_read = min((size_t)BUFFER_SIZE, AUDIO_CHUNK_SIZE - audio_buffer_pos);
 
-            // Debug: Print first few samples to check for actual audio data
-            if (samples_read > 4 && audio_buffer_pos < 100) // Only log first few chunks
+            if (samples_to_read > 0 && M5.Mic.record(audio_buffer.get() + audio_buffer_pos, samples_to_read, SAMPLE_RATE))
             {
-                Serial.printf("Audio samples: %d, %d, %d, %d (total: %d)\n",
-                              temp_buffer[0], temp_buffer[1], temp_buffer[2], temp_buffer[3], samples_read);
-            }
+                // Debug: Print first few samples to verify real audio
+                if (audio_buffer_pos < 100) // Only log first few chunks
+                {
+                    Serial.printf("Audio samples: %d, %d, %d, %d (total: %zu)\n",
+                                  audio_buffer[audio_buffer_pos],
+                                  audio_buffer[audio_buffer_pos + 1],
+                                  audio_buffer[audio_buffer_pos + 2],
+                                  audio_buffer[audio_buffer_pos + 3],
+                                  samples_to_read);
+                }
 
-            // Copy samples to our buffer if there's space
-            for (size_t i = 0; i < samples_read && audio_buffer_pos < AUDIO_CHUNK_SIZE; i++)
-            {
-                audio_buffer[audio_buffer_pos++] = temp_buffer[i];
+                audio_buffer_pos += samples_to_read;
             }
-        }
-        else if (ret != ESP_OK)
-        {
-            Serial.printf("I2S read failed: ret=%d, bytes_read=%d\n", ret, bytes_read);
         }
 
         // Visual feedback - pulse recording indicator
@@ -876,7 +931,7 @@ void loop()
         if (millis() - lastPulse > 500) // Pulse every 500ms
         {
             pulseState = !pulseState;
-            uint16_t color = pulseState ? TFT_RED : TFT_MAROON; // Use TFT_MAROON instead of TFT_DARKRED
+            uint16_t color = pulseState ? TFT_RED : TFT_MAROON;
             M5.Display.fillCircle(M5.Display.width() - 20, 20, 8, color);
             lastPulse = millis();
         }
