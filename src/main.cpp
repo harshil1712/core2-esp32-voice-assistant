@@ -15,8 +15,8 @@
 // WebSocket server configuration
 #define WS_HOST "DNS_OR_IP_ADDRESS" // Replace with your server address
 // Alternative: #define WS_HOST "192.168.0.1" // Try router IP if direct connection fails
-#define WS_PORT 443   // Replace with your server port
-#define WS_PATH "/ws" // WebSocket endpoint
+#define WS_PORT 443                        // Replace with your server port
+#define WS_PATH "/agents/voice-agent/chat" // WebSocket endpoint
 // Test settings: #define WS_PORT 5174 and #define WS_PATH "/"
 
 // Device states for MVP
@@ -100,6 +100,8 @@ size_t expected_audio_size = 0;
 size_t received_audio_size = 0;
 int expected_chunks = 0;
 int received_chunks = 0;
+bool streaming_mode = false;                    // Track streaming vs buffered mode
+const size_t MAX_STREAMING_AUDIO_SIZE = 153600; // 150KB max for streaming
 
 // MVP Implementation - Core Functions
 
@@ -276,56 +278,131 @@ void handle_transcription_message(const char *json_string)
     }
     else if (strcmp(type, "audio_start") == 0)
     {
-        // Handle chunked audio start
-        expected_audio_size = doc["totalSize"];
-        expected_chunks = doc["chunks"];
-        int chunk_size = doc["chunkSize"];
+        // Detect streaming mode (no totalSize provided)
+        streaming_mode = doc.containsKey("streaming") && doc["streaming"] == true;
 
-        LOG_INFO(WS_TAG, "Starting chunked audio reception: %u bytes, %d chunks, %d bytes/chunk",
-                 expected_audio_size, expected_chunks, chunk_size);
+        if (streaming_mode)
+        {
+            // STREAMING MODE: unknown total size, use max buffer
+            expected_audio_size = MAX_STREAMING_AUDIO_SIZE;
+            expected_chunks = 0; // Unknown chunk count
+            int chunk_size = doc["chunkSize"] | 8192;
 
-        // Allocate buffer for full audio
+            LOG_INFO(WS_TAG, "Starting STREAMING audio: max %u bytes, chunk %d bytes",
+                     expected_audio_size, chunk_size);
+            update_display_with_transcription("Receiving Audio", "Streaming...");
+        }
+        else
+        {
+            // BUFFERED MODE: known total size (backward compatible)
+            expected_audio_size = doc["totalSize"];
+            expected_chunks = doc["chunks"];
+            int chunk_size = doc["chunkSize"];
+
+            LOG_INFO(WS_TAG, "Starting BUFFERED audio: %u bytes, %d chunks, %d bytes/chunk",
+                     expected_audio_size, expected_chunks, chunk_size);
+            update_display_with_transcription("Receiving Audio", "Downloading...");
+        }
+
+        // Allocate buffer
         chunked_audio_buffer.reset(new uint8_t[expected_audio_size]);
+
+        if (!chunked_audio_buffer)
+        {
+            LOG_ERROR(WS_TAG, "Failed to allocate %u bytes", expected_audio_size);
+            update_display_with_transcription("Error", "Out of memory");
+            return;
+        }
+
         received_audio_size = 0;
         received_chunks = 0;
         receiving_chunked_audio = true;
 
-        update_display_with_transcription("Receiving Audio", "Downloading chunks...");
+        LOG_INFO(WS_TAG, "Buffer allocated, free heap: %u bytes", ESP.getFreeHeap());
     }
     else if (strcmp(type, "audio_complete") == 0)
     {
-        // Handle chunked audio completion
-        LOG_INFO(WS_TAG, "Chunked audio reception complete: %u bytes, %d chunks",
-                 received_audio_size, received_chunks);
+        // Extract server-reported totals
+        size_t server_total = doc["totalBytes"] | 0;
+        int server_chunks = doc["chunks"] | 0;
 
-        if (receiving_chunked_audio && received_audio_size == expected_audio_size)
+        LOG_INFO(WS_TAG, "Audio complete - Mode: %s, Received: %u bytes (%d chunks), Server: %u bytes (%d chunks)",
+                 streaming_mode ? "STREAMING" : "BUFFERED",
+                 received_audio_size, received_chunks, server_total, server_chunks);
+
+        if (!receiving_chunked_audio)
         {
-            // Debug: Check first few bytes of reassembled audio
-            LOG_INFO(WS_TAG, "First 8 bytes of reassembled audio: %02x %02x %02x %02x %02x %02x %02x %02x",
-                     chunked_audio_buffer[0], chunked_audio_buffer[1], chunked_audio_buffer[2], chunked_audio_buffer[3],
-                     chunked_audio_buffer[4], chunked_audio_buffer[5], chunked_audio_buffer[6], chunked_audio_buffer[7]);
+            LOG_ERROR(WS_TAG, "Received audio_complete but not in receiving state!");
+            return;
+        }
 
-            // Comprehensive debugging
-            LOG_INFO(WS_TAG, "CHUNK DEBUG: Expected %u bytes, received %u bytes, chunks %d/%d",
-                     expected_audio_size, received_audio_size, received_chunks, expected_chunks);
+        bool valid = false;
 
-            // Play the reassembled audio
-            LOG_INFO(WS_TAG, "Playing reassembled audio: %u bytes", received_audio_size);
+        if (streaming_mode)
+        {
+            // STREAMING: validate against server's reported total
+            if (server_total > 0 && received_audio_size == server_total)
+            {
+                LOG_INFO(WS_TAG, "STREAMING validation OK: %u bytes match", received_audio_size);
+                valid = true;
+            }
+            else if (received_audio_size > 0 && server_total == 0)
+            {
+                LOG_INFO(WS_TAG, "STREAMING validation OK: %u bytes (no server total)", received_audio_size);
+                valid = true;
+            }
+            else
+            {
+                LOG_ERROR(WS_TAG, "STREAMING validation FAILED: received %u, expected %u",
+                          received_audio_size, server_total);
+            }
+        }
+        else
+        {
+            // BUFFERED: validate against expected_audio_size
+            if (received_audio_size == expected_audio_size)
+            {
+                LOG_INFO(WS_TAG, "BUFFERED validation OK: %u/%u bytes",
+                         received_audio_size, expected_audio_size);
+                valid = true;
+            }
+            else
+            {
+                LOG_ERROR(WS_TAG, "BUFFERED validation FAILED: received %u, expected %u",
+                          received_audio_size, expected_audio_size);
+            }
+        }
+
+        if (valid && received_audio_size > 0)
+        {
+            // Debug first bytes
+            LOG_INFO(WS_TAG, "First 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
+                     chunked_audio_buffer[0], chunked_audio_buffer[1],
+                     chunked_audio_buffer[2], chunked_audio_buffer[3],
+                     chunked_audio_buffer[4], chunked_audio_buffer[5],
+                     chunked_audio_buffer[6], chunked_audio_buffer[7]);
+
+            // Play using ACTUAL received size (critical for streaming)
+            LOG_INFO(WS_TAG, "Playing audio: %u bytes", received_audio_size);
             set_state(STATE_SPEAKING);
             play_audio_response(chunked_audio_buffer.get(), received_audio_size);
         }
         else
         {
-            LOG_ERROR(WS_TAG, "Audio chunk mismatch: received %u bytes, expected %u bytes",
-                      received_audio_size, expected_audio_size);
-            update_display_with_transcription("Audio Error", "Incomplete audio received");
+            LOG_ERROR(WS_TAG, "Audio validation failed - not playing");
+            update_display_with_transcription("Audio Error", "Invalid audio");
             delay(2000);
             set_state(STATE_READY);
         }
 
-        // Reset chunked audio state
+        // Clean up ALL state
         receiving_chunked_audio = false;
+        streaming_mode = false;
         chunked_audio_buffer.reset();
+        expected_audio_size = 0;
+        received_audio_size = 0;
+        expected_chunks = 0;
+        received_chunks = 0;
     }
     else if (strcmp(type, "connection") == 0)
     {
@@ -435,26 +512,61 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 
         if (receiving_chunked_audio)
         {
-            // This is a chunk of the audio stream
+            // Validate chunk won't overflow buffer
             if (received_audio_size + length <= expected_audio_size)
             {
+                // Safe to copy chunk
                 memcpy(chunked_audio_buffer.get() + received_audio_size, payload, length);
                 received_audio_size += length;
                 received_chunks++;
 
-                LOG_INFO(WS_TAG, "Received chunk %d/%d: %u bytes (total: %u/%u bytes)",
-                         received_chunks, expected_chunks, length, received_audio_size, expected_audio_size);
+                // Mode-specific logging
+                if (streaming_mode)
+                {
+                    LOG_INFO(WS_TAG, "Streaming chunk %d: %u bytes (total: %u/%u bytes)",
+                             received_chunks, length, received_audio_size, expected_audio_size);
+                }
+                else
+                {
+                    LOG_INFO(WS_TAG, "Buffered chunk %d/%d: %u bytes (total: %u/%u bytes)",
+                             received_chunks, expected_chunks, length, received_audio_size, expected_audio_size);
+                }
 
-                // Update progress display
-                int progress = (received_audio_size * 100) / expected_audio_size;
-                char progress_text[50];
-                snprintf(progress_text, sizeof(progress_text), "Progress: %d%% (%d/%d chunks)",
-                         progress, received_chunks, expected_chunks);
+                // Mode-specific progress display
+                char progress_text[60];
+                if (streaming_mode)
+                {
+                    // Streaming: show KB received (no percentage - total unknown)
+                    float kb = received_audio_size / 1024.0f;
+                    snprintf(progress_text, sizeof(progress_text), "%.1f KB in %d chunks",
+                             kb, received_chunks);
+                }
+                else
+                {
+                    // Buffered: show percentage and chunk count
+                    int progress = (received_audio_size * 100) / expected_audio_size;
+                    snprintf(progress_text, sizeof(progress_text), "%d%% (%d/%d chunks)",
+                             progress, received_chunks, expected_chunks);
+                }
                 update_display_with_transcription("Receiving Audio", progress_text);
             }
             else
             {
-                LOG_ERROR(WS_TAG, "Audio chunk overflow: would exceed expected size");
+                // OVERFLOW DETECTED
+                LOG_ERROR(WS_TAG, "Buffer overflow! Chunk=%u bytes, received=%u, max=%u",
+                          length, received_audio_size, expected_audio_size);
+
+                if (streaming_mode)
+                {
+                    // Critical error in streaming mode
+                    LOG_ERROR(WS_TAG, "CRITICAL: Streaming exceeded %u byte limit!", expected_audio_size);
+                    update_display_with_transcription("Error", "Audio too large");
+
+                    // Clean up to prevent further overflow attempts
+                    receiving_chunked_audio = false;
+                    streaming_mode = false;
+                    chunked_audio_buffer.reset();
+                }
             }
         }
         else
@@ -614,8 +726,8 @@ void play_audio_response(uint8_t *data, size_t length)
     }
 
     // Set volume and configure speaker for better quality
-    M5.Speaker.setVolume(120);           // Balanced volume for clarity
-    M5.Speaker.setChannelVolume(0, 120); // Ensure consistent channel volume
+    M5.Speaker.setVolume(240);           // Increased volume for better audibility
+    M5.Speaker.setChannelVolume(0, 240); // Ensure consistent channel volume
 
     // ---------------------------
     // New validation: peak + RMS
@@ -700,7 +812,7 @@ void play_audio_response(uint8_t *data, size_t length)
 
         // Configure speaker for optimal playback before playing
         M5.Speaker.stop();                   // Ensure clean start
-        M5.Speaker.setAllChannelVolume(120); // Set all channels consistently
+        M5.Speaker.setAllChannelVolume(240); // Set all channels consistently
 
         // STREAMING PLAYBACK: Use triple-buffering like SD card code for smooth playback
         static constexpr const size_t buf_num = 3;
