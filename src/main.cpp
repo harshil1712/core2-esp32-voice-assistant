@@ -7,6 +7,9 @@
 #include <cstring>
 #include <memory>
 #include <cmath>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/ringbuf.h>
 
 #define WIFI_SSID "WIFI_SSID"
 #define WIFI_PASS "PASSWORD"
@@ -78,6 +81,12 @@ void check_processing_timeout();
 void check_recording_timeout();
 // void test_speaker_hardware();
 
+// FreeRTOS task function declarations
+void audio_playback_task(void *parameter);
+bool buffer_audio_chunk_to_ringbuf(const uint8_t *data, size_t length);
+void create_audio_playback_task();
+void destroy_audio_playback_task();
+
 // Global variables for recording state
 bool is_recording = false;
 std::unique_ptr<int16_t[]> audio_buffer;
@@ -93,15 +102,24 @@ const unsigned long PROCESSING_TIMEOUT = 30000; // 30 seconds timeout
 unsigned long recording_start_time = 0;
 const unsigned long RECORDING_TIMEOUT = 5000; // 5 seconds max recording
 
-// Variables for chunked audio reception
-bool receiving_chunked_audio = false;
-std::unique_ptr<uint8_t[]> chunked_audio_buffer;
-size_t expected_audio_size = 0;
-size_t received_audio_size = 0;
-int expected_chunks = 0;
-int received_chunks = 0;
-bool streaming_mode = false;                    // Track streaming vs buffered mode
-const size_t MAX_STREAMING_AUDIO_SIZE = 153600; // 150KB max for streaming
+// ESP-IDF ring buffer for audio streaming
+RingbufHandle_t audio_ring_buffer = nullptr;
+static constexpr const size_t RING_BUFFER_SIZE = 131072; // 128KB (16 chunks @ 8192 bytes each)
+
+// Playback task handle
+TaskHandle_t audio_playback_task_handle = nullptr;
+volatile bool audio_playback_task_running = false;
+
+// Playback state machine
+enum PlaybackState
+{
+    PLAYBACK_IDLE,
+    PLAYBACK_RECEIVING, // Pre-buffering
+    PLAYBACK_PLAYING,   // Active playback
+    PLAYBACK_DRAINING,  // Finishing buffer after audio_complete
+    PLAYBACK_COMPLETE   // Ready for cleanup
+};
+volatile PlaybackState playback_state = PLAYBACK_IDLE;
 
 // MVP Implementation - Core Functions
 
@@ -145,7 +163,6 @@ void set_state(DeviceState new_state)
 // Simple display function
 void update_display(const char *message)
 {
-    LOG_INFO(LCD_TAG, "Display: %s", message);
 
     // Clear screen
     M5.Display.fillScreen(TFT_BLACK);
@@ -180,7 +197,7 @@ void update_display_with_transcription(const char *status, const char *transcrip
     if (transcription && strlen(transcription) > 0)
     {
         M5.Display.setTextColor(TFT_WHITE);
-        M5.Display.setTextSize(1);
+        M5.Display.setTextSize(4);
         M5.Display.setCursor(10, 50);
 
         // Word wrap for long transcriptions
@@ -214,7 +231,7 @@ void update_display_with_transcription(const char *status, const char *transcrip
 
     // Display instructions at bottom
     M5.Display.setTextColor(TFT_YELLOW);
-    M5.Display.setTextSize(1);
+    M5.Display.setTextSize(2);
     M5.Display.setCursor(10, M5.Display.height() - 30);
     M5.Display.print("Tap to speak");
 }
@@ -278,131 +295,35 @@ void handle_transcription_message(const char *json_string)
     }
     else if (strcmp(type, "audio_start") == 0)
     {
-        // Detect streaming mode (no totalSize provided)
-        streaming_mode = doc.containsKey("streaming") && doc["streaming"] == true;
+        LOG_INFO(WS_TAG, "Audio start - creating playback task");
 
-        if (streaming_mode)
+        // Display "Speaking" immediately (user preference)
+        set_state(STATE_SPEAKING);
+        update_display_with_transcription("Speaking", last_response.c_str());
+
+        // CRITICAL: Set state BEFORE creating task to avoid race condition
+        playback_state = PLAYBACK_RECEIVING;
+
+        create_audio_playback_task();
+
+        if (audio_playback_task_handle == nullptr)
         {
-            // STREAMING MODE: unknown total size, use max buffer
-            expected_audio_size = MAX_STREAMING_AUDIO_SIZE;
-            expected_chunks = 0; // Unknown chunk count
-            int chunk_size = doc["chunkSize"] | 8192;
-
-            LOG_INFO(WS_TAG, "Starting STREAMING audio: max %u bytes, chunk %d bytes",
-                     expected_audio_size, chunk_size);
-            update_display_with_transcription("Receiving Audio", "Streaming...");
-        }
-        else
-        {
-            // BUFFERED MODE: known total size (backward compatible)
-            expected_audio_size = doc["totalSize"];
-            expected_chunks = doc["chunks"];
-            int chunk_size = doc["chunkSize"];
-
-            LOG_INFO(WS_TAG, "Starting BUFFERED audio: %u bytes, %d chunks, %d bytes/chunk",
-                     expected_audio_size, expected_chunks, chunk_size);
-            update_display_with_transcription("Receiving Audio", "Downloading...");
-        }
-
-        // Allocate buffer
-        chunked_audio_buffer.reset(new uint8_t[expected_audio_size]);
-
-        if (!chunked_audio_buffer)
-        {
-            LOG_ERROR(WS_TAG, "Failed to allocate %u bytes", expected_audio_size);
-            update_display_with_transcription("Error", "Out of memory");
+            LOG_ERROR(WS_TAG, "Failed to create playback task");
+            update_display_with_transcription("Error", "Playback failed");
+            set_state(STATE_READY);
+            playback_state = PLAYBACK_IDLE; // Reset state on failure
             return;
         }
-
-        received_audio_size = 0;
-        received_chunks = 0;
-        receiving_chunked_audio = true;
-
-        LOG_INFO(WS_TAG, "Buffer allocated, free heap: %u bytes", ESP.getFreeHeap());
     }
     else if (strcmp(type, "audio_complete") == 0)
     {
-        // Extract server-reported totals
-        size_t server_total = doc["totalBytes"] | 0;
-        int server_chunks = doc["chunks"] | 0;
+        LOG_INFO(WS_TAG, "Audio complete - draining buffer");
 
-        LOG_INFO(WS_TAG, "Audio complete - Mode: %s, Received: %u bytes (%d chunks), Server: %u bytes (%d chunks)",
-                 streaming_mode ? "STREAMING" : "BUFFERED",
-                 received_audio_size, received_chunks, server_total, server_chunks);
-
-        if (!receiving_chunked_audio)
+        if (playback_state == PLAYBACK_RECEIVING ||
+            playback_state == PLAYBACK_PLAYING)
         {
-            LOG_ERROR(WS_TAG, "Received audio_complete but not in receiving state!");
-            return;
+            playback_state = PLAYBACK_DRAINING;
         }
-
-        bool valid = false;
-
-        if (streaming_mode)
-        {
-            // STREAMING: validate against server's reported total
-            if (server_total > 0 && received_audio_size == server_total)
-            {
-                LOG_INFO(WS_TAG, "STREAMING validation OK: %u bytes match", received_audio_size);
-                valid = true;
-            }
-            else if (received_audio_size > 0 && server_total == 0)
-            {
-                LOG_INFO(WS_TAG, "STREAMING validation OK: %u bytes (no server total)", received_audio_size);
-                valid = true;
-            }
-            else
-            {
-                LOG_ERROR(WS_TAG, "STREAMING validation FAILED: received %u, expected %u",
-                          received_audio_size, server_total);
-            }
-        }
-        else
-        {
-            // BUFFERED: validate against expected_audio_size
-            if (received_audio_size == expected_audio_size)
-            {
-                LOG_INFO(WS_TAG, "BUFFERED validation OK: %u/%u bytes",
-                         received_audio_size, expected_audio_size);
-                valid = true;
-            }
-            else
-            {
-                LOG_ERROR(WS_TAG, "BUFFERED validation FAILED: received %u, expected %u",
-                          received_audio_size, expected_audio_size);
-            }
-        }
-
-        if (valid && received_audio_size > 0)
-        {
-            // Debug first bytes
-            LOG_INFO(WS_TAG, "First 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
-                     chunked_audio_buffer[0], chunked_audio_buffer[1],
-                     chunked_audio_buffer[2], chunked_audio_buffer[3],
-                     chunked_audio_buffer[4], chunked_audio_buffer[5],
-                     chunked_audio_buffer[6], chunked_audio_buffer[7]);
-
-            // Play using ACTUAL received size (critical for streaming)
-            LOG_INFO(WS_TAG, "Playing audio: %u bytes", received_audio_size);
-            set_state(STATE_SPEAKING);
-            play_audio_response(chunked_audio_buffer.get(), received_audio_size);
-        }
-        else
-        {
-            LOG_ERROR(WS_TAG, "Audio validation failed - not playing");
-            update_display_with_transcription("Audio Error", "Invalid audio");
-            delay(2000);
-            set_state(STATE_READY);
-        }
-
-        // Clean up ALL state
-        receiving_chunked_audio = false;
-        streaming_mode = false;
-        chunked_audio_buffer.reset();
-        expected_audio_size = 0;
-        received_audio_size = 0;
-        expected_chunks = 0;
-        received_chunks = 0;
     }
     else if (strcmp(type, "connection") == 0)
     {
@@ -482,6 +403,29 @@ void handle_touch()
     }
 }
 
+// Ring buffer write helper - non-blocking
+bool buffer_audio_chunk_to_ringbuf(const uint8_t *data, size_t length)
+{
+    if (audio_ring_buffer == nullptr)
+    {
+        return false;
+    }
+
+    BaseType_t result = xRingbufferSend(
+        audio_ring_buffer,
+        data,
+        length,
+        0 // Non-blocking: drop if full
+    );
+
+    if (result != pdTRUE)
+    {
+        LOG_ERROR(WS_TAG, "Ring buffer full, chunk dropped");
+    }
+
+    return (result == pdTRUE);
+}
+
 // WebSocket event handler
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 {
@@ -489,7 +433,17 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     {
     case WStype_DISCONNECTED:
         LOG_ERROR(WS_TAG, "WebSocket Disconnected - length: %u, heap free: %u bytes", length, ESP.getFreeHeap());
+
+        // Clean up playback task if running
+        if (audio_playback_task_handle != nullptr)
+        {
+            audio_playback_task_running = false;
+            vTaskDelay(pdMS_TO_TICKS(100));
+            destroy_audio_playback_task();
+        }
+
         websocket_connected = false;
+        playback_state = PLAYBACK_IDLE; // Reset playback state to prevent stuck states
         set_state(STATE_ERROR);
         break;
     case WStype_ERROR:
@@ -508,76 +462,14 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
         handle_transcription_message((const char *)payload);
         break;
     case WStype_BIN:
-        LOG_INFO(WS_TAG, "Received binary data: %u bytes, heap before: %u bytes", length, ESP.getFreeHeap());
+        LOG_INFO(WS_TAG, "Received binary chunk: %u bytes", length);
 
-        if (receiving_chunked_audio)
+        if (playback_state == PLAYBACK_RECEIVING ||
+            playback_state == PLAYBACK_PLAYING ||
+            playback_state == PLAYBACK_DRAINING)
         {
-            // Validate chunk won't overflow buffer
-            if (received_audio_size + length <= expected_audio_size)
-            {
-                // Safe to copy chunk
-                memcpy(chunked_audio_buffer.get() + received_audio_size, payload, length);
-                received_audio_size += length;
-                received_chunks++;
-
-                // Mode-specific logging
-                if (streaming_mode)
-                {
-                    LOG_INFO(WS_TAG, "Streaming chunk %d: %u bytes (total: %u/%u bytes)",
-                             received_chunks, length, received_audio_size, expected_audio_size);
-                }
-                else
-                {
-                    LOG_INFO(WS_TAG, "Buffered chunk %d/%d: %u bytes (total: %u/%u bytes)",
-                             received_chunks, expected_chunks, length, received_audio_size, expected_audio_size);
-                }
-
-                // Mode-specific progress display
-                char progress_text[60];
-                if (streaming_mode)
-                {
-                    // Streaming: show KB received (no percentage - total unknown)
-                    float kb = received_audio_size / 1024.0f;
-                    snprintf(progress_text, sizeof(progress_text), "%.1f KB in %d chunks",
-                             kb, received_chunks);
-                }
-                else
-                {
-                    // Buffered: show percentage and chunk count
-                    int progress = (received_audio_size * 100) / expected_audio_size;
-                    snprintf(progress_text, sizeof(progress_text), "%d%% (%d/%d chunks)",
-                             progress, received_chunks, expected_chunks);
-                }
-                update_display_with_transcription("Receiving Audio", progress_text);
-            }
-            else
-            {
-                // OVERFLOW DETECTED
-                LOG_ERROR(WS_TAG, "Buffer overflow! Chunk=%u bytes, received=%u, max=%u",
-                          length, received_audio_size, expected_audio_size);
-
-                if (streaming_mode)
-                {
-                    // Critical error in streaming mode
-                    LOG_ERROR(WS_TAG, "CRITICAL: Streaming exceeded %u byte limit!", expected_audio_size);
-                    update_display_with_transcription("Error", "Audio too large");
-
-                    // Clean up to prevent further overflow attempts
-                    receiving_chunked_audio = false;
-                    streaming_mode = false;
-                    chunked_audio_buffer.reset();
-                }
-            }
+            buffer_audio_chunk_to_ringbuf(payload, length);
         }
-        else
-        {
-            // Legacy: single large audio message (fallback)
-            LOG_INFO(WS_TAG, "Received complete audio: %u bytes", length);
-            set_state(STATE_SPEAKING);
-            play_audio_response(payload, length);
-        }
-
-        LOG_INFO(WS_TAG, "Binary data processed, heap after: %u bytes", ESP.getFreeHeap());
         break;
     default:
         break;
@@ -646,10 +538,30 @@ void start_recording()
         return;
 
     LOG_INFO(AUDIO_TAG, "Starting recording...");
+
+    // CRITICAL FIX: Restart microphone after speaker playback
+    // The M5Stack Core2 shares the I2S bus between speaker and microphone
+    // After playback, the microphone needs to be restarted to capture audio
+    LOG_INFO(AUDIO_TAG, "Restarting microphone...");
+    M5.Mic.end(); // Stop microphone
+    delay(100);   // Wait for I2S bus to be released
+
+    if (!M5.Mic.begin())
+    {
+        LOG_ERROR(AUDIO_TAG, "Failed to restart microphone");
+        set_state(STATE_ERROR);
+        return;
+    }
+    LOG_INFO(AUDIO_TAG, "Microphone restarted successfully");
+
     set_state(STATE_LISTENING);
     is_recording = true;
     audio_buffer_pos = 0;
     recording_start_time = millis(); // Start recording timeout timer
+
+    // Clear the audio buffer before starting new recording
+    memset(audio_buffer.get(), 0, AUDIO_CHUNK_SIZE * sizeof(int16_t));
+    LOG_INFO(AUDIO_TAG, "Audio buffer cleared");
 
     // Visual feedback for recording start
     update_display_with_transcription("RECORDING", "Speak now... Tap again to stop");
@@ -690,30 +602,6 @@ void play_audio_response(uint8_t *data, size_t length)
 {
     LOG_INFO(AUDIO_TAG, "Playing audio response: %u bytes", (unsigned)length);
 
-    // DEBUGGING: Dump first 100 bytes as hex to see exact data
-    LOG_INFO(AUDIO_TAG, "Raw audio data dump:");
-    for (int i = 0; i < min(100, (int)length); i += 16)
-    {
-        char hex_line[120];
-        sprintf(hex_line, "%04x: ", i);
-        for (int j = 0; j < 16 && (i + j) < length; j++)
-        {
-            sprintf(hex_line + strlen(hex_line), "%02x ", data[i + j]);
-        }
-        Serial.println(hex_line);
-    }
-
-    // Enhanced audio debugging - log first 16 bytes to analyze format
-    if (length >= 16)
-    {
-        LOG_INFO(AUDIO_TAG, "Audio format analysis - First 16 bytes (should be immediate audio data):");
-        for (int i = 0; i < 16; i += 2)
-        {
-            int16_t sample = (int16_t)(data[i] | (data[i + 1] << 8));
-            Serial.printf("  [%d-%d]: 0x%02x%02x -> %d\n", i, i + 1, data[i], data[i + 1], sample);
-        }
-    }
-
     // Short-audio check (keep existing behavior)
     if (length < 1000)
     {
@@ -726,8 +614,8 @@ void play_audio_response(uint8_t *data, size_t length)
     }
 
     // Set volume and configure speaker for better quality
-    M5.Speaker.setVolume(240);           // Increased volume for better audibility
-    M5.Speaker.setChannelVolume(0, 240); // Ensure consistent channel volume
+    M5.Speaker.setVolume(255);           // Maximum volume (0-255 range)
+    M5.Speaker.setChannelVolume(0, 255); // Maximum channel volume
 
     // ---------------------------
     // New validation: peak + RMS
@@ -869,6 +757,325 @@ void play_audio_response(uint8_t *data, size_t length)
     }
 }
 
+// Task management functions
+void create_audio_playback_task()
+{
+    if (audio_playback_task_handle != nullptr)
+    {
+        LOG_ERROR(AUDIO_TAG, "Playback task already running");
+        return;
+    }
+
+    // Create ring buffer
+    audio_ring_buffer = xRingbufferCreate(RING_BUFFER_SIZE, RINGBUF_TYPE_NOSPLIT);
+    if (audio_ring_buffer == nullptr)
+    {
+        LOG_ERROR(AUDIO_TAG, "Failed to create ring buffer");
+        return;
+    }
+
+    audio_playback_task_running = true;
+
+    // Create task: 8KB stack, priority 3, pinned to Core 1
+    BaseType_t result = xTaskCreatePinnedToCore(
+        audio_playback_task,
+        "audio_playback",
+        8192,
+        nullptr,
+        3, // Higher than M5.Speaker's spk_task (priority 2)
+        &audio_playback_task_handle,
+        1 // Core 1
+    );
+
+    if (result != pdPASS)
+    {
+        LOG_ERROR(AUDIO_TAG, "Failed to create playback task");
+        vRingbufferDelete(audio_ring_buffer);
+        audio_ring_buffer = nullptr;
+        audio_playback_task_running = false;
+    }
+    else
+    {
+        LOG_INFO(AUDIO_TAG, "Playback task created, heap: %u bytes", ESP.getFreeHeap());
+    }
+}
+
+void destroy_audio_playback_task()
+{
+    if (audio_playback_task_handle == nullptr)
+    {
+        return;
+    }
+
+    LOG_INFO(AUDIO_TAG, "Destroying playback task");
+    audio_playback_task_running = false;
+
+    // Wait for task to exit (max 2 seconds)
+    for (int i = 0; i < 40 && audio_playback_task_handle != nullptr; i++)
+    {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (audio_playback_task_handle != nullptr)
+    {
+        LOG_ERROR(AUDIO_TAG, "Task didn't exit cleanly, force deleting");
+        vTaskDelete(audio_playback_task_handle);
+        audio_playback_task_handle = nullptr;
+    }
+
+    if (audio_ring_buffer != nullptr)
+    {
+        vRingbufferDelete(audio_ring_buffer);
+        audio_ring_buffer = nullptr;
+    }
+
+    LOG_INFO(AUDIO_TAG, "Playback task destroyed, heap: %u bytes", ESP.getFreeHeap());
+}
+
+// Audio playback task - runs in separate FreeRTOS task
+void audio_playback_task(void *parameter)
+{
+    LOG_INFO(AUDIO_TAG, "Audio playback task started");
+
+    // Declare all variables at function scope to avoid goto issues
+    static constexpr const size_t BUFFER_COUNT = 3;
+    static constexpr const size_t PLAYBACK_BUFFER_SIZE = 8192;
+    uint8_t *play_buffers[BUFFER_COUNT] = {nullptr, nullptr, nullptr};
+    int prebuffer_count = 0;
+    const int PREBUFFER_CHUNKS = 2;
+    size_t prebuffer_sizes[2] = {0, 0}; // Store sizes of pre-buffered chunks
+    size_t buffer_idx = 0;
+    unsigned long last_chunk_time = millis();
+    const unsigned long CHUNK_TIMEOUT = 2000;
+    size_t item_size;
+    uint8_t *chunk;
+    int initial_wait = 0; // For waiting after pre-buffering
+
+    // Triple-buffer allocation (heap, not stack)
+    for (int i = 0; i < BUFFER_COUNT; i++)
+    {
+        play_buffers[i] = (uint8_t *)heap_caps_malloc(
+            PLAYBACK_BUFFER_SIZE,
+            MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        if (play_buffers[i] == nullptr)
+        {
+            LOG_ERROR(AUDIO_TAG, "Failed to allocate play buffer %d", i);
+            goto task_cleanup;
+        }
+    }
+
+    // CRITICAL FIX: Restart speaker to reconfigure I2S bus after microphone recording
+    // The I2S bus was configured for input (microphone), now we need output (speaker)
+    LOG_INFO(AUDIO_TAG, "Restarting speaker for playback...");
+    M5.Speaker.end();   // Stop speaker
+    delay(100);         // Wait for I2S bus to be released
+    M5.Speaker.begin(); // Restart speaker
+
+    // Configure speaker
+    M5.Speaker.stop();
+    M5.Speaker.setAllChannelVolume(240);
+    LOG_INFO(AUDIO_TAG, "Speaker configured for playback");
+
+    // PRE-BUFFERING: Wait for 2 chunks and queue them
+    while (prebuffer_count < PREBUFFER_CHUNKS &&
+           audio_playback_task_running &&
+           playback_state == PLAYBACK_RECEIVING)
+    {
+
+        chunk = (uint8_t *)xRingbufferReceive(
+            audio_ring_buffer,
+            &item_size,
+            pdMS_TO_TICKS(5000) // 5 second timeout to account for network latency and TTS processing
+        );
+
+        if (chunk != nullptr)
+        {
+            // Validate chunk size to prevent buffer overflow
+            if (item_size > PLAYBACK_BUFFER_SIZE)
+            {
+                LOG_ERROR(AUDIO_TAG, "Chunk too large: %d bytes (max %d)", item_size, PLAYBACK_BUFFER_SIZE);
+                vRingbufferReturnItem(audio_ring_buffer, chunk);
+                playback_state = PLAYBACK_COMPLETE;
+                goto task_cleanup;
+            }
+
+            // Copy to play buffer
+            memcpy(play_buffers[prebuffer_count], chunk, item_size);
+            prebuffer_sizes[prebuffer_count] = item_size;
+            vRingbufferReturnItem(audio_ring_buffer, chunk);
+            prebuffer_count++;
+        }
+    }
+
+    if (prebuffer_count < PREBUFFER_CHUNKS)
+    {
+        LOG_ERROR(AUDIO_TAG, "Pre-buffer timeout");
+        playback_state = PLAYBACK_COMPLETE;
+        goto task_cleanup;
+    }
+
+    // PLAYBACK: Start with pre-buffered chunks
+    playback_state = PLAYBACK_PLAYING;
+
+    // Queue pre-buffered chunks to speaker
+    for (int i = 0; i < prebuffer_count; i++)
+    {
+        M5.Speaker.playRaw(
+            (const int16_t *)play_buffers[i],
+            prebuffer_sizes[i] >> 1, // Convert bytes to samples
+            24000,
+            false, 1, 0);
+    }
+
+    // CRITICAL: Wait for speaker to START playing AND have room in queue
+    // After queuing, playback may not start immediately, so we must wait for status != 0
+    initial_wait = 0;
+    while (initial_wait < 200)
+    { // Max 1 second wait (200 * 5ms)
+        size_t status = M5.Speaker.isPlaying(0);
+
+        if (status == 1)
+        {
+            // Playing with room in queue - perfect, proceed!
+            LOG_INFO(AUDIO_TAG, "Speaker started, queue has room");
+            break;
+        }
+
+        if (status == 2)
+        {
+            // Playing but queue full - wait for room to open up
+            vTaskDelay(pdMS_TO_TICKS(5));
+            initial_wait++;
+            continue;
+        }
+
+        // status == 0: Not playing yet, wait for playback to start
+        vTaskDelay(pdMS_TO_TICKS(10));
+        initial_wait++;
+    }
+
+    if (initial_wait >= 200)
+    {
+        LOG_ERROR(AUDIO_TAG, "Playback failed to start or queue timeout");
+        goto task_cleanup;
+    }
+
+    // Start buffer rotation after pre-buffered chunks
+    buffer_idx = prebuffer_count % BUFFER_COUNT;
+    last_chunk_time = millis(); // Reset for playback loop
+
+    while (audio_playback_task_running)
+    {
+        if (playback_state == PLAYBACK_COMPLETE)
+            break;
+
+        // CRITICAL: Check speaker queue BEFORE consuming from ring buffer
+        // isPlaying(0) returns: 0=not playing, 1=has room, 2=queue full
+        int wait_attempts = 0;
+        const int MAX_WAIT_ATTEMPTS = 200; // 200 * 5ms = 1 second max wait
+
+        while (wait_attempts < MAX_WAIT_ATTEMPTS)
+        {
+            size_t speaker_status = M5.Speaker.isPlaying(0);
+
+            if (speaker_status == 0)
+            {
+                // Not playing - something went wrong or finished early
+                LOG_ERROR(AUDIO_TAG, "Speaker stopped unexpectedly");
+                goto playback_done;
+            }
+
+            if (speaker_status == 1)
+            {
+                // Queue has room - safe to proceed!
+                break;
+            }
+
+            // speaker_status == 2: Queue is full, wait WITHOUT consuming from ring buffer
+            vTaskDelay(pdMS_TO_TICKS(5));
+            wait_attempts++;
+        }
+
+        if (wait_attempts >= MAX_WAIT_ATTEMPTS)
+        {
+            LOG_ERROR(AUDIO_TAG, "Speaker queue wait timeout");
+            break;
+        }
+
+        // Now safe to receive from ring buffer - speaker has room
+        chunk = (uint8_t *)xRingbufferReceive(
+            audio_ring_buffer,
+            &item_size,
+            pdMS_TO_TICKS(100));
+
+        if (chunk != nullptr)
+        {
+            // Validate chunk size to prevent buffer overflow
+            if (item_size > PLAYBACK_BUFFER_SIZE)
+            {
+                LOG_ERROR(AUDIO_TAG, "Playback chunk too large: %d bytes (max %d)", item_size, PLAYBACK_BUFFER_SIZE);
+                vRingbufferReturnItem(audio_ring_buffer, chunk);
+                break;
+            }
+
+            // Copy to rotating buffer
+            memcpy(play_buffers[buffer_idx], chunk, item_size);
+            vRingbufferReturnItem(audio_ring_buffer, chunk);
+
+            // Queue to M5.Speaker (non-blocking)
+            M5.Speaker.playRaw(
+                (const int16_t *)play_buffers[buffer_idx],
+                item_size >> 1, // Convert bytes to samples
+                24000,
+                false, 1, 0);
+
+            buffer_idx = (buffer_idx + 1) % BUFFER_COUNT;
+            last_chunk_time = millis();
+            // NO DELAY - consume next chunk immediately if available!
+        }
+        else
+        {
+            // No chunk available
+            if (playback_state == PLAYBACK_DRAINING)
+            {
+                LOG_INFO(AUDIO_TAG, "Buffer empty in drain mode - finishing");
+                break; // Buffer empty in drain mode - done
+            }
+            else if (millis() - last_chunk_time > CHUNK_TIMEOUT)
+            {
+                LOG_ERROR(AUDIO_TAG, "Chunk timeout during playback");
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+
+playback_done:
+    // Wait for speaker to finish
+    LOG_INFO(AUDIO_TAG, "Waiting for speaker to finish");
+    while (M5.Speaker.isPlaying())
+    {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    playback_state = PLAYBACK_COMPLETE;
+    LOG_INFO(AUDIO_TAG, "Playback complete");
+
+task_cleanup:
+    for (int i = 0; i < BUFFER_COUNT; i++)
+    {
+        if (play_buffers[i] != nullptr)
+        {
+            heap_caps_free(play_buffers[i]);
+        }
+    }
+
+    audio_playback_task_running = false;
+    audio_playback_task_handle = nullptr; // CRITICAL: Clear before self-delete
+    LOG_INFO(AUDIO_TAG, "Task exiting");
+    vTaskDelete(nullptr);
+}
+
 // Check for processing timeout
 void check_processing_timeout()
 {
@@ -958,48 +1165,24 @@ void setup()
     }
 }
 
-// Test speaker hardware with pure tone
-// void test_speaker_hardware()
-// {
-//     LOG_INFO(AUDIO_TAG, "Testing speaker hardware with 800Hz tone");
-
-//     const int sample_rate = 24000;
-//     const int duration_ms = 200; // 1 second
-//     const int frequency = 100;   // 800Hz tone
-//     const int samples = sample_rate * duration_ms / 1000;
-
-//     // Generate pure sine wave
-//     int16_t *tone_buffer = new int16_t[samples];
-//     for (int i = 0; i < samples; i++)
-//     {
-//         float t = (float)i / sample_rate;
-//         float amplitude = 0.3; // 30% volume to avoid clipping
-//         tone_buffer[i] = (int16_t)(amplitude * 32767 * sin(2 * M_PI * frequency * t));
-//     }
-
-//     LOG_INFO(AUDIO_TAG, "Generated %d samples for tone test", samples);
-
-//     // Configure and play tone
-//     M5.Speaker.stop();
-//     M5.Speaker.setVolume(120);
-//     M5.Speaker.playRaw((uint8_t *)tone_buffer, samples * sizeof(int16_t), sample_rate, false, 1, 0);
-
-//     // Wait for completion
-//     while (M5.Speaker.isPlaying())
-//     {
-//         delay(50);
-//     }
-
-//     delete[] tone_buffer;
-//     LOG_INFO(AUDIO_TAG, "Hardware tone test completed");
-// }
-
 void loop()
 {
-    // Handle WebSocket events (skip during critical audio playback)
-    if (current_state != STATE_SPEAKING)
+    // Handle WebSocket events - no longer skipped during playback!
+    webSocket.loop();
+
+    // Check for playback task completion
+    if (playback_state == PLAYBACK_COMPLETE)
     {
-        webSocket.loop();
+        LOG_INFO(TAG, "Playback completed, cleaning up");
+
+        destroy_audio_playback_task();
+        playback_state = PLAYBACK_IDLE;
+        set_state(STATE_READY);
+
+        if (last_transcription.length() > 0)
+        {
+            update_display_with_transcription("Ready", last_transcription.c_str());
+        }
     }
 
     // Handle touch input
@@ -1022,19 +1205,17 @@ void loop()
 
             if (samples_to_read > 0 && M5.Mic.record(audio_buffer.get() + audio_buffer_pos, samples_to_read, SAMPLE_RATE))
             {
-                // Debug: Print first few samples to verify real audio
-                if (audio_buffer_pos < 100) // Only log first few chunks
-                {
-                    Serial.printf("Audio samples: %d, %d, %d, %d (total: %zu)\n",
-                                  audio_buffer[audio_buffer_pos],
-                                  audio_buffer[audio_buffer_pos + 1],
-                                  audio_buffer[audio_buffer_pos + 2],
-                                  audio_buffer[audio_buffer_pos + 3],
-                                  samples_to_read);
-                }
 
                 audio_buffer_pos += samples_to_read;
             }
+            else
+            {
+                LOG_ERROR(AUDIO_TAG, "M5.Mic.record() failed or samples_to_read is 0");
+            }
+        }
+        else
+        {
+            LOG_ERROR(AUDIO_TAG, "Microphone is not enabled!");
         }
 
         // Visual feedback - pulse recording indicator
