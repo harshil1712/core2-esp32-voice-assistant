@@ -6,11 +6,11 @@
 #include <cstring>
 #include <cmath>
 
-#define WIFI_SSID "SSD"
-#define WIFI_PASS "PASSWORD"
+#define WIFI_SSID "Harshil-2.4"
+#define WIFI_PASS "!9q*Dh*Az%PyqYNe"
 #define WIFI_MAXIMUM_RETRY 5
 
-#define WS_HOST "demo.workers.com"
+#define WS_HOST "ws-server-core2.api-harshil.workers.dev"
 #define WS_PORT 443
 #define WS_PATH "/agents/voice-agent/default"
 
@@ -401,8 +401,8 @@ void start_playback()
         return;
     LOG_INFO(AUDIO_TAG, "Starting audio playback");
     M5.Speaker.stop();
-    M5.Speaker.setVolume(120);
-    M5.Speaker.setAllChannelVolume(120);
+    M5.Speaker.setVolume(255);
+    M5.Speaker.setAllChannelVolume(255);
     is_playing = true;
 }
 
@@ -530,8 +530,8 @@ void init_audio()
         LOG_ERROR(AUDIO_TAG, "Failed to start M5 microphone");
     }
 
-    M5.Speaker.setVolume(120);
-    M5.Speaker.setChannelVolume(0, 120);
+    M5.Speaker.setVolume(255);
+    M5.Speaker.setChannelVolume(0, 255);
 
     LOG_INFO(AUDIO_TAG, "Audio system initialized");
 }
